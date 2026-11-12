@@ -379,8 +379,8 @@ $(cd "$OUTPUT_DIR" && sed 's/^/    /' SHA256SUMS)
 
 \`\`\`sh
 gh release create v$VERSION \\
-  outputs/*.tar.gz outputs/SHA256SUMS outputs/mise-tools.toml \\
-  --title "smtpmaster v$VERSION" --notes-file outputs/release-notes.md
+  ./*.tar.gz SHA256SUMS mise-tools.toml \\
+  --title "smtpmaster v$VERSION" --notes-file release-notes.md
 \`\`\`
 EOF
 

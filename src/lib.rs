@@ -10,5 +10,6 @@ pub mod render;
 pub mod router;
 pub mod schedule;
 pub mod serde_bson;
+pub mod service;
 pub mod smtp;
 pub mod store;

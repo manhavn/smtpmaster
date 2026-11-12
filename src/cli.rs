@@ -19,6 +19,7 @@ use crate::model::{Account, Provider, TlsMode, parse_reset_at, validate_timezone
 use crate::render;
 use crate::router::Router;
 use crate::schedule::{Schedule, parse_window};
+use crate::service;
 use crate::smtp;
 use crate::store::Store;
 
@@ -62,6 +63,12 @@ enum Command {
     Maintenance(MaintenanceArgs),
     /// Show routing statistics.
     Stats,
+    /// Generate and install a systemd unit for auto-start.
+    #[command(visible_alias = "autostart")]
+    Service {
+        #[command(subcommand)]
+        command: ServiceCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -248,6 +255,49 @@ struct ServeArgs {
 }
 
 #[derive(Debug, Args)]
+struct ServiceOptions {
+    /// Install a systemd *user* unit (no root required).
+    #[arg(long, conflicts_with = "system")]
+    user: bool,
+    /// Install a system unit (default; needs root).
+    #[arg(long, conflicts_with = "user")]
+    system: bool,
+    /// Unit name without the .service suffix.
+    #[arg(long, default_value = "smtpmaster")]
+    name: String,
+    /// Executable to run (default: the current binary).
+    #[arg(long)]
+    bin: Option<PathBuf>,
+    /// Environment variable for the service, KEY=VALUE (repeatable).
+    #[arg(long = "env", value_name = "KEY=VALUE")]
+    env: Vec<String>,
+    /// Show what would be done without touching the system.
+    #[arg(long)]
+    dry_run: bool,
+}
+
+#[derive(Debug, Subcommand)]
+enum ServiceCommand {
+    /// Print the generated unit file.
+    Print(ServiceOptions),
+    /// Write the unit, reload systemd and enable the service.
+    Install {
+        #[command(flatten)]
+        options: ServiceOptions,
+        /// Enable the unit without starting it now.
+        #[arg(long)]
+        no_start: bool,
+        /// Overwrite an existing unit file.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Stop, disable and remove the unit.
+    Uninstall(ServiceOptions),
+    /// Show the service status via systemctl.
+    Status(ServiceOptions),
+}
+
+#[derive(Debug, Args)]
 struct MaintenanceArgs {
     /// Keep running instead of doing a single pass.
     #[arg(long)]
@@ -296,6 +346,7 @@ pub async fn run() -> Result<()> {
                 }
             }
         }
+        Command::Service { command } => handle_service(cli.config.as_deref(), command),
         Command::Stats => {
             let store = connect(&config).await?;
             let stats = store.stats(Utc::now()).await?;
@@ -782,6 +833,65 @@ async fn connect(config: &Config) -> Result<Store> {
         config.log.retention_days,
     )
     .await
+}
+
+fn handle_service(config_path: Option<&std::path::Path>, command: ServiceCommand) -> Result<()> {
+    match command {
+        ServiceCommand::Print(options) => {
+            let unit = build_unit_options(config_path, &options)?;
+            let path = service::unit_path(unit.scope, &unit.name)?;
+            println!("# {}", path.display());
+            print!("{}", unit.render());
+            Ok(())
+        }
+        ServiceCommand::Install {
+            options,
+            no_start,
+            force,
+        } => {
+            let unit = build_unit_options(config_path, &options)?;
+            if unit.config.is_none() {
+                eprintln!(
+                    "warning: no config file found; the service will use built-in defaults and environment variables"
+                );
+            }
+            service::install(&unit, force, no_start, options.dry_run)
+        }
+        ServiceCommand::Uninstall(options) => {
+            service::uninstall(&options.name, service_scope(&options), options.dry_run)
+        }
+        ServiceCommand::Status(options) => service::status(&options.name, service_scope(&options)),
+    }
+}
+
+fn service_scope(options: &ServiceOptions) -> service::Scope {
+    if options.user {
+        service::Scope::User
+    } else {
+        service::Scope::System
+    }
+}
+
+fn build_unit_options(
+    config_path: Option<&std::path::Path>,
+    options: &ServiceOptions,
+) -> Result<service::UnitOptions> {
+    let exec = match &options.bin {
+        Some(path) => service::absolute(path)?,
+        None => {
+            let current = std::env::current_exe()?;
+            current.canonicalize().unwrap_or(current)
+        }
+    };
+    let config = service::resolve_config(config_path)?;
+    let environment = service::parse_environment(&options.env)?;
+    service::UnitOptions::new(
+        &options.name,
+        exec,
+        config,
+        environment,
+        service_scope(options),
+    )
 }
 
 fn init_tracing(verbose: u8) {

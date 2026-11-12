@@ -39,6 +39,8 @@ flowchart LR
 - **Relay SMTP** có AUTH PLAIN/LOGIN (tuỳ chọn), giới hạn kích thước message,
   số recipient, số connection.
 - **Log gửi** trong collection `send_log` (TTL theo ngày), thống kê `stats`.
+- **Tự khởi động**: `smtpmaster service install` sinh systemd unit (system hoặc
+  `--user`), `autostart` là alias. `service print/status/uninstall` có sẵn.
 
 ## Yêu cầu
 
@@ -171,6 +173,29 @@ Chế độ chọn tài khoản:
 
 `--sequential` ép 1 worker; mặc định số mail gửi song song tối đa là
 `concurrency`.
+
+## Tự khởi động cùng systemd
+
+```sh
+# Unit hệ thống (cần root), nhúng config tuyệt đối vào ExecStart
+sudo smtpmaster service install --config /etc/smtpmaster.toml
+
+# Xem unit sẽ tạo mà không ghi gì
+smtpmaster service print --user
+
+# Unit cấp user (không cần root)
+smtpmaster service install --user
+loginctl enable-linger "$USER"   # tự chạy cả khi chưa đăng nhập
+
+smtpmaster service status
+sudo smtpmaster service uninstall
+```
+
+`service install` dùng chính binary đang chạy (hoặc `--bin`), nhúng đường dẫn
+config đã resolve, thêm biến môi trường bằng `--env KEY=VALUE` (mặc định
+`SMTPMASTER_LOG=info`), đặt `Restart=on-failure`, `LimitNOFILE=65536` và
+hardening cơ bản. Có `--dry-run`, `--no-start`, `--force`. Alias tương đương:
+`smtpmaster autostart install`.
 
 ## Vận hành
 
