@@ -12,7 +12,7 @@ use clap::{Args, Parser, Subcommand};
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 
-use crate::config::{Config, SelectionMode, ServerConfig};
+use crate::config::{self, Config, SelectionMode, ServerConfig};
 use crate::duration::DurationSpec;
 use crate::error::{AppError, Result};
 use crate::maintenance;
@@ -25,17 +25,53 @@ use crate::service;
 use crate::smtp;
 use crate::store::Store;
 
+const FULL_EXAMPLE: &str = r#"Full example (every setting):
+  smtpmaster \
+    --mongo-uri "mongodb://127.0.0.1:27017" \
+    --mongo-db smtpmaster \
+    --listen 0.0.0.0:2525 \
+    --hostname smtpmaster.local \
+    --mode priority \
+    --concurrency 8 \
+    --sequential=false \
+    --max-attempts 0 \
+    --fail-threshold 5 \
+    --send-timeout-secs 60 \
+    --max-message-size 26214400 \
+    --max-recipients 100 \
+    --max-connections 256 \
+    --auth-required=false \
+    --rewrite-from-header=false \
+    --relay-user relay:change-me \
+    --maintenance-interval-secs 30 \
+    --log-retention-days 14 \
+    serve
+
+Account example (every account option):
+  smtpmaster account add --name gmail-a --provider google \
+    --host smtp.gmail.com --port 587 --tls starttls \
+    --username bot@example.com --password-env GMAIL_APP_PASSWORD \
+    --from bot@example.com --from-name "Bot A" \
+    --priority 10 --count-max 500 --total-max 50000 --rate-limit 60 \
+    --reset-at 03:30 --timezone Asia/Ho_Chi_Minh --expires-in 3m \
+    --window "mon-fri 08:00-17:00@1"
+
+Route and dashboard:
+  smtpmaster route add --name app1 --username app1 --password-env APP1_PASS \
+    --account gmail-a --account gmail-b
+  smtpmaster admin enable --token <TOKEN> --listen 127.0.0.1:8787"#;
+
 #[derive(Debug, Parser)]
 #[command(
     name = "smtpmaster",
     version,
     about = "Route outbound SMTP through MongoDB-managed accounts",
+    after_help = FULL_EXAMPLE,
     propagate_version = true
 )]
 pub struct Cli {
-    /// Configuration file (default: ./smtpmaster.toml when present).
-    #[arg(long, global = true, value_name = "PATH")]
-    config: Option<PathBuf>,
+    #[command(flatten)]
+    settings: SettingsArgs,
 
     /// Print machine-readable JSON.
     #[arg(long, global = true)]
@@ -47,6 +83,101 @@ pub struct Cli {
 
     #[command(subcommand)]
     command: Command,
+}
+
+/// Global settings accepted before or after any subcommand. Flags override
+/// `SMTPMASTER_*` environment variables, which override built-in defaults.
+#[derive(Debug, Args)]
+struct SettingsArgs {
+    /// MongoDB connection string.
+    #[arg(long, global = true, value_name = "URI", alias = "mongodb-uri")]
+    mongo_uri: Option<String>,
+    /// MongoDB database name.
+    #[arg(
+        long,
+        global = true,
+        value_name = "NAME",
+        alias = "database",
+        alias = "mongodb-db"
+    )]
+    mongo_db: Option<String>,
+    /// SMTP listen address for `serve`.
+    #[arg(long, global = true, value_name = "ADDR")]
+    listen: Option<String>,
+    /// SMTP banner hostname.
+    #[arg(long, global = true)]
+    hostname: Option<String>,
+    /// Selection mode: priority, round-robin or time-window.
+    #[arg(long, global = true, value_name = "MODE")]
+    mode: Option<SelectionMode>,
+    /// Maximum concurrent upstream sends.
+    #[arg(long, global = true)]
+    concurrency: Option<usize>,
+    /// Deliver one message at a time (use `--sequential=false` to turn off).
+    #[arg(long, global = true, num_args = 0..=1, default_missing_value = "true", require_equals = true, value_name = "BOOL")]
+    sequential: Option<bool>,
+    /// Accounts to try per message; 0 tries every eligible account.
+    #[arg(long, global = true)]
+    max_attempts: Option<usize>,
+    /// Disable an account after N consecutive failures (0 = never).
+    #[arg(long, global = true)]
+    fail_threshold: Option<u32>,
+    /// Upstream SMTP session timeout in seconds.
+    #[arg(long, global = true)]
+    send_timeout_secs: Option<u64>,
+    /// Maximum accepted message size in bytes.
+    #[arg(long, global = true)]
+    max_message_size: Option<usize>,
+    /// Maximum recipients per message.
+    #[arg(long, global = true)]
+    max_recipients: Option<usize>,
+    /// Maximum simultaneous client connections.
+    #[arg(long, global = true)]
+    max_connections: Option<usize>,
+    /// Require AUTH from clients (use `--auth-required=false` to turn off).
+    #[arg(long, global = true, num_args = 0..=1, default_missing_value = "true", require_equals = true, value_name = "BOOL")]
+    auth_required: Option<bool>,
+    /// Rewrite the From header to the selected account identity.
+    #[arg(long, global = true, num_args = 0..=1, default_missing_value = "true", require_equals = true, value_name = "BOOL")]
+    rewrite_from_header: Option<bool>,
+    /// Relay client credentials, repeatable (`user:pass`).
+    #[arg(long = "relay-user", global = true, value_name = "USER:PASS")]
+    relay_users: Vec<String>,
+    /// Quota reset / expiry sweep interval in seconds.
+    #[arg(long, global = true)]
+    maintenance_interval_secs: Option<u64>,
+    /// Days to keep send_log documents.
+    #[arg(long, global = true)]
+    log_retention_days: Option<u32>,
+}
+
+impl SettingsArgs {
+    fn overrides(&self) -> Result<config::Overrides> {
+        let mut users = Vec::new();
+        for entry in &self.relay_users {
+            users.push(config::parse_user_entry(entry)?);
+        }
+        Ok(config::Overrides {
+            mongo_uri: self.mongo_uri.clone(),
+            mongo_db: self.mongo_db.clone(),
+            listen: self.listen.clone(),
+            hostname: self.hostname.clone(),
+            mode: self.mode,
+            concurrency: self.concurrency,
+            sequential: self.sequential,
+            max_attempts: self.max_attempts,
+            fail_threshold: self.fail_threshold,
+            send_timeout_secs: self.send_timeout_secs,
+            max_message_size: self.max_message_size,
+            max_recipients: self.max_recipients,
+            max_connections: self.max_connections,
+            auth_required: self.auth_required,
+            rewrite_from_header: self.rewrite_from_header,
+            users,
+            maintenance_interval_secs: self.maintenance_interval_secs,
+            log_retention_days: self.log_retention_days,
+        })
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -65,6 +196,7 @@ enum Command {
         command: RouteCommand,
     },
     /// Run the SMTP relay that distributes mail across accounts.
+    #[command(after_help = FULL_EXAMPLE)]
     Serve(ServeArgs),
     /// Reset quota windows and disable expired accounts.
     Maintenance(MaintenanceArgs),
@@ -338,23 +470,6 @@ enum AdminCommand {
 
 #[derive(Debug, Args)]
 struct ServeArgs {
-    #[arg(long)]
-    listen: Option<String>,
-    #[arg(long)]
-    mode: Option<SelectionMode>,
-    #[arg(long)]
-    concurrency: Option<usize>,
-    /// Send one message at a time.
-    #[arg(long)]
-    sequential: bool,
-    #[arg(long)]
-    auth_required: bool,
-    #[arg(long)]
-    rewrite_from_header: bool,
-    #[arg(long)]
-    max_message_size: Option<usize>,
-    #[arg(long)]
-    max_connections: Option<usize>,
     /// Detach and keep running in the background.
     #[arg(long)]
     daemon: bool,
@@ -422,7 +537,9 @@ struct MaintenanceArgs {
 pub async fn run() -> Result<()> {
     let cli = Cli::parse();
     init_tracing(cli.verbose);
-    let config = Config::load(cli.config.as_deref())?;
+    let mut config = Config::from_env()?;
+    config.apply_overrides(&cli.settings.overrides()?)?;
+    config.validate()?;
     match cli.command {
         Command::Init => {
             let store = connect(&config).await?;
@@ -460,7 +577,7 @@ pub async fn run() -> Result<()> {
                 }
             }
         }
-        Command::Service { command } => handle_service(cli.config.as_deref(), command),
+        Command::Service { command } => handle_service(&config, command),
         Command::Stats => {
             let store = connect(&config).await?;
             let stats = store.stats(Utc::now()).await?;
@@ -889,31 +1006,7 @@ async fn serve(config: Config, args: ServeArgs) -> Result<()> {
     if args.daemon && std::env::var("SMTPMASTER_DAEMONIZED").as_deref() != Ok("1") {
         return daemonize(&args);
     }
-    let mut server: ServerConfig = config.server.clone();
-    if let Some(listen) = args.listen {
-        server.listen = listen;
-    }
-    if let Some(mode) = args.mode {
-        server.mode = mode;
-    }
-    if let Some(concurrency) = args.concurrency {
-        server.concurrency = concurrency;
-    }
-    if args.sequential {
-        server.sequential = true;
-    }
-    if args.auth_required {
-        server.auth_required = true;
-    }
-    if args.rewrite_from_header {
-        server.rewrite_from_header = true;
-    }
-    if let Some(size) = args.max_message_size {
-        server.max_message_size = size;
-    }
-    if let Some(connections) = args.max_connections {
-        server.max_connections = connections;
-    }
+    let server: ServerConfig = config.server.clone();
     let store = Arc::new(connect(&config).await?);
     store.ensure_indexes().await?;
     if server.auth_required && server.users.is_empty() && !store.routes_active().await? {
@@ -927,7 +1020,7 @@ async fn serve(config: Config, args: ServeArgs) -> Result<()> {
     tracing::info!(
         %address,
         mode = %server.mode,
-        workers = if server.sequential { 1 } else { server.concurrency },
+        workers = config.send_workers(),
         "smtp router listening"
     );
 
@@ -1313,10 +1406,10 @@ fn truncate_text(input: String, max: usize) -> String {
     out
 }
 
-fn handle_service(config_path: Option<&std::path::Path>, command: ServiceCommand) -> Result<()> {
+fn handle_service(config: &Config, command: ServiceCommand) -> Result<()> {
     match command {
         ServiceCommand::Print(options) => {
-            let unit = build_unit_options(config_path, &options)?;
+            let unit = build_unit_options(config, &options)?;
             let path = service::unit_path(unit.scope, &unit.name)?;
             println!("# {}", path.display());
             print!("{}", unit.render());
@@ -1327,12 +1420,7 @@ fn handle_service(config_path: Option<&std::path::Path>, command: ServiceCommand
             no_start,
             force,
         } => {
-            let unit = build_unit_options(config_path, &options)?;
-            if unit.config.is_none() {
-                eprintln!(
-                    "warning: no config file found; the service will use built-in defaults and environment variables"
-                );
-            }
+            let unit = build_unit_options(config, &options)?;
             service::install(&unit, force, no_start, options.dry_run)
         }
         ServiceCommand::Uninstall(options) => {
@@ -1350,10 +1438,7 @@ fn service_scope(options: &ServiceOptions) -> service::Scope {
     }
 }
 
-fn build_unit_options(
-    config_path: Option<&std::path::Path>,
-    options: &ServiceOptions,
-) -> Result<service::UnitOptions> {
+fn build_unit_options(config: &Config, options: &ServiceOptions) -> Result<service::UnitOptions> {
     let exec = match &options.bin {
         Some(path) => service::absolute(path)?,
         None => {
@@ -1361,14 +1446,68 @@ fn build_unit_options(
             current.canonicalize().unwrap_or(current)
         }
     };
-    let config = service::resolve_config(config_path)?;
-    let environment = service::parse_environment(&options.env)?;
+    let mut environment = service::parse_environment(&options.env)?;
+    // The effective settings are embedded so the unit is self-contained.
+    environment.retain(|(key, _)| key != "SMTPMASTER_MONGODB_URI" && key != "SMTPMASTER_USERS");
+    environment.push((
+        "SMTPMASTER_MONGODB_URI".to_string(),
+        config.mongodb.uri.clone(),
+    ));
+    if !config.server.users.is_empty() {
+        let users = config
+            .server
+            .users
+            .iter()
+            .map(|user| format!("{}:{}", user.username, user.password))
+            .collect::<Vec<_>>()
+            .join(",");
+        environment.push(("SMTPMASTER_USERS".to_string(), users));
+    }
+    environment.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let mut extra_args = vec![
+        "--mongo-db".to_string(),
+        config.mongodb.database.clone(),
+        "--listen".to_string(),
+        config.server.listen.clone(),
+        "--hostname".to_string(),
+        config.server.hostname.clone(),
+        "--mode".to_string(),
+        config.server.mode.to_string(),
+        "--concurrency".to_string(),
+        config.server.concurrency.to_string(),
+        "--max-attempts".to_string(),
+        config.server.max_attempts.to_string(),
+        "--fail-threshold".to_string(),
+        config.server.fail_threshold.to_string(),
+        "--send-timeout-secs".to_string(),
+        config.server.send_timeout_secs.to_string(),
+        "--max-message-size".to_string(),
+        config.server.max_message_size.to_string(),
+        "--max-recipients".to_string(),
+        config.server.max_recipients.to_string(),
+        "--max-connections".to_string(),
+        config.server.max_connections.to_string(),
+        "--maintenance-interval-secs".to_string(),
+        config.maintenance.interval_secs.to_string(),
+        "--log-retention-days".to_string(),
+        config.log.retention_days.to_string(),
+    ];
+    if config.server.sequential {
+        extra_args.push("--sequential".to_string());
+    }
+    if config.server.auth_required {
+        extra_args.push("--auth-required".to_string());
+    }
+    if config.server.rewrite_from_header {
+        extra_args.push("--rewrite-from-header".to_string());
+    }
     service::UnitOptions::new(
         &options.name,
         exec,
-        config,
         environment,
         service_scope(options),
+        extra_args,
     )
 }
 

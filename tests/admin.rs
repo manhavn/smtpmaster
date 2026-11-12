@@ -117,7 +117,10 @@ async fn dashboard_manages_accounts_and_routes() {
         eprintln!("skipping: SMTPMASTER_TEST_MONGO_URI not set");
         return;
     };
-    store.insert_account(&account("admin-account")).await.unwrap();
+    store
+        .insert_account(&account("admin-account"))
+        .await
+        .unwrap();
     let app = admin::router(Arc::clone(&store), TOKEN.to_string());
 
     let (status, body) = call(&app, Method::GET, "/api/accounts", Some(TOKEN), None).await;
@@ -178,7 +181,14 @@ async fn dashboard_manages_accounts_and_routes() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(store.find_account("admin-account").await.unwrap().count_used, 0);
+    assert_eq!(
+        store
+            .find_account("admin-account")
+            .await
+            .unwrap()
+            .count_used,
+        0
+    );
 
     let stored = store.find_account("admin-account").await.unwrap();
     let route = Route::new("admin-route", "app", "secret", vec![stored.id], Utc::now());

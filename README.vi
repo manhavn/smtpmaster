@@ -89,32 +89,93 @@ install -m 0755 smtpmaster ~/.local/bin/
 
 ## Cấu hình
 
-Copy `config.example.toml` thành `smtpmaster.toml` (hoặc trỏ `--config`).
-Mọi giá trị đều có thể override bằng biến môi trường `SMTPMASTER_*`:
-`SMTPMASTER_MONGODB_URI`, `SMTPMASTER_MONGODB_DB`, `SMTPMASTER_LISTEN`,
-`SMTPMASTER_MODE`, `SMTPMASTER_CONCURRENCY`, `SMTPMASTER_SEQUENTIAL`,
-`SMTPMASTER_AUTH_REQUIRED`, `SMTPMASTER_USERS="user:pass,user2:pass2"`,
-`SMTPMASTER_LOG`, `SMTPMASTER_MAX_MESSAGE_SIZE`, …
+**Không dùng file cấu hình.** Thứ tự ưu tiên: mặc định → biến môi trường
+`SMTPMASTER_*` → cờ dòng lệnh (cao nhất). Cờ dùng được trước hoặc sau
+subcommand.
 
-```toml
-[mongodb]
-uri = "mongodb://127.0.0.1:27017"
-database = "smtpmaster"
+```sh
+# Tối thiểu: chỉ cần MongoDB
+smtpmaster --mongo-uri "mongodb://127.0.0.1:27017" --mongo-db smtpmaster init
+```
 
-[server]
-listen = "0.0.0.0:2525"
-hostname = "smtpmaster.local"
-mode = "priority"          # priority | round-robin | time-window
-concurrency = 8            # số mail gửi song song tối đa
-sequential = false         # true = gửi lần lượt
-max_attempts = 3
-fail_threshold = 5
-auth_required = false
-rewrite_from_header = false
+### Toàn bộ tham số
 
-[[server.users]]
-username = "relay"
-password = "change-me"
+| Cờ | Biến môi trường | Mặc định | Ý nghĩa |
+|---|---|---|---|
+| `--mongo-uri <URI>` | `SMTPMASTER_MONGODB_URI` | `mongodb://127.0.0.1:27017` | Chuỗi kết nối MongoDB |
+| `--mongo-db <NAME>` | `SMTPMASTER_MONGODB_DB` | `smtpmaster` | Tên database |
+| `--listen <ADDR>` | `SMTPMASTER_LISTEN` | `0.0.0.0:2525` | Địa chỉ SMTP relay lắng nghe |
+| `--hostname <NAME>` | `SMTPMASTER_HOSTNAME` | `smtpmaster` | Tên banner / EHLO |
+| `--mode <MODE>` | `SMTPMASTER_MODE` | `priority` | `priority`, `round-robin`, `time-window` |
+| `--concurrency <N>` | `SMTPMASTER_CONCURRENCY` | `8` | Số mail gửi upstream song song tối đa |
+| `--sequential[=BOOL]` | `SMTPMASTER_SEQUENTIAL` | `false` | Gửi lần lượt từng mail |
+| `--max-attempts <N>` | `SMTPMASTER_MAX_ATTEMPTS` | `0` | Số account thử cho mỗi mail; `0` = tất cả |
+| `--fail-threshold <N>` | `SMTPMASTER_FAIL_THRESHOLD` | `5` | Tự disable sau N lỗi liên tiếp (`0` = không) |
+| `--send-timeout-secs <N>` | `SMTPMASTER_SEND_TIMEOUT_SECS` | `60` | Timeout phiên SMTP upstream |
+| `--max-message-size <BYTES>` | `SMTPMASTER_MAX_MESSAGE_SIZE` | `26214400` | Kích thước message tối đa |
+| `--max-recipients <N>` | `SMTPMASTER_MAX_RECIPIENTS` | `100` | Số recipient tối đa mỗi mail |
+| `--max-connections <N>` | `SMTPMASTER_MAX_CONNECTIONS` | `256` | Số kết nối client đồng thời |
+| `--auth-required[=BOOL]` | `SMTPMASTER_AUTH_REQUIRED` | `false` | Bắt buộc AUTH (route luôn bắt buộc) |
+| `--rewrite-from-header[=BOOL]` | `SMTPMASTER_REWRITE_FROM_HEADER` | `false` | Ghi lại header `From:` theo account |
+| `--relay-user <USER:PASS>` | `SMTPMASTER_USERS` (danh sách phẩy) | — | Tài khoản relay; lặp lại được |
+| `--maintenance-interval-secs <N>` | `SMTPMASTER_MAINTENANCE_INTERVAL_SECS` | `30` | Chu kỳ reset quota/quét hết hạn |
+| `--log-retention-days <N>` | `SMTPMASTER_LOG_RETENTION_DAYS` | `14` | TTL của `send_log` |
+
+`--sequential`, `--auth-required`, `--rewrite-from-header` nhận giá trị tuỳ
+chọn: `--auth-required` = bật, `--auth-required=false` = tắt. `--relay-user`
+không được chứa `:` trong username hoặc `,` trong password.
+
+### Lệnh đầy đủ
+
+```sh
+# serve với toàn bộ tham số
+smtpmaster \
+  --mongo-uri "mongodb://127.0.0.1:27017" \
+  --mongo-db smtpmaster \
+  --listen 0.0.0.0:2525 \
+  --hostname smtpmaster.local \
+  --mode priority \
+  --concurrency 8 \
+  --sequential=false \
+  --max-attempts 0 \
+  --fail-threshold 5 \
+  --send-timeout-secs 60 \
+  --max-message-size 26214400 \
+  --max-recipients 100 \
+  --max-connections 256 \
+  --auth-required=false \
+  --rewrite-from-header=false \
+  --relay-user relay:change-me \
+  --maintenance-interval-secs 30 \
+  --log-retention-days 14 \
+  serve
+
+# account với toàn bộ tuỳ chọn
+smtpmaster account add --name gmail-a --provider google \
+  --host smtp.gmail.com --port 587 --tls starttls \
+  --username bot@example.com --password-env GMAIL_APP_PASSWORD \
+  --from bot@example.com --from-name "Bot A" \
+  --priority 10 --count-max 500 --total-max 50000 --rate-limit 60 \
+  --reset-at 03:30 --timezone Asia/Ho_Chi_Minh \
+  --expires-in 3m \
+  --window "mon-fri 08:00-17:00@1" \
+  --window "sat,sun 10:00-18:00@20"
+
+# route với toàn bộ tuỳ chọn
+smtpmaster route add --name app1 --username app1 \
+  --password-env APP1_PASS --description "Pool app 1" \
+  --account gmail-a --account gmail-b
+
+# systemd (nhúng cấu hình hiệu lực; file unit mode 0600)
+sudo smtpmaster --mongo-uri "mongodb://127.0.0.1:27017" --mongo-db smtpmaster \
+  --listen 0.0.0.0:2525 --mode priority --concurrency 8 \
+  --max-attempts 0 --auth-required=false \
+  service install --name smtpmaster --force --no-start --env SMTPMASTER_LOG=info
+
+# Dashboard
+smtpmaster admin enable --token "$(openssl rand -hex 24)" --listen 127.0.0.1:8787
+smtpmaster admin status
+smtpmaster admin disable
 ```
 
 ## Quản lý tài khoản
@@ -199,7 +260,7 @@ quota của app1 chỉ tác động pool app1. Nếu chưa tạo route nào, rel
 
 ```sh
 smtpmaster init                 # tạo index, kiểm tra MongoDB
-smtpmaster serve                # đọc smtpmaster.toml
+smtpmaster serve                # dùng cờ/biến môi trường
 smtpmaster serve --mode round-robin --concurrency 16
 smtpmaster serve --sequential   # gửi lần lượt từng mail một
 ```
@@ -261,7 +322,7 @@ chạy.
 
 ```sh
 # Unit hệ thống (cần root), nhúng config tuyệt đối vào ExecStart
-sudo smtpmaster service install --config /etc/smtpmaster.toml
+sudo smtpmaster --mongo-uri "mongodb://127.0.0.1:27017" --mongo-db smtpmaster service install
 
 # Xem unit sẽ tạo mà không ghi gì
 smtpmaster service print --user
@@ -274,8 +335,9 @@ smtpmaster service status
 sudo smtpmaster service uninstall
 ```
 
-`service install` dùng chính binary đang chạy (hoặc `--bin`), nhúng đường dẫn
-config đã resolve, thêm biến môi trường bằng `--env KEY=VALUE` (mặc định
+`service install` dùng chính binary đang chạy (hoặc `--bin`) và nhúng toàn bộ
+cấu hình hiệu lực vào ExecStart, cùng `Environment=` cho MongoDB URI và relay
+users; vẫn nhận `--env KEY=VALUE` (mặc định
 `SMTPMASTER_LOG=info`), đặt `Restart=on-failure`, `LimitNOFILE=65536` và
 hardening cơ bản. Có `--dry-run`, `--no-start`, `--force`. Alias tương đương:
 `smtpmaster autostart install`.
@@ -309,7 +371,7 @@ Script sẽ:
 2. Tự cài tool còn thiếu (mise: `rust`, `zig`, `cargo-zigbuild`).
 3. Build tĩnh musl cho `x86_64-unknown-linux-musl` và
    `aarch64-unknown-linux-musl` với `-D warnings` (build sạch warning).
-4. Kiểm tra binary thật sự static, đóng gói kèm README/LICENSE/config mẫu.
+4. Kiểm tra binary thật sự static, đóng gói kèm hai README và LICENSE.
 5. Sinh `outputs/SHA256SUMS`, `outputs/mise-tools.toml`,
    `outputs/release-notes.md`.
 
@@ -342,7 +404,7 @@ upstream, cả hai chiều AUTH).
 ```
 src/
   cli.rs          # clap commands + xử lý lệnh
-  config.rs       # TOML + env overrides
+  config.rs       # defaults + env + CLI overrides
   model.rs        # Account, quota window, expiry
   route.rs        # inbound identity + outbound account pool
   admin.rs        # token-protected dashboard + runtime toggle

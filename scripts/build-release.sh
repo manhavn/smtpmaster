@@ -308,10 +308,10 @@ for index in "${!BUILT_ARCHES[@]}"; do
     name="smtpmaster-${VERSION}-linux-musl-${arch}"
     mkdir -p "$STAGE/$name"
     cp "$bin" "$STAGE/$name/smtpmaster"
-    cp README.md README.vi LICENSE config.example.toml "$STAGE/$name/"
+    cp README.md README.vi LICENSE "$STAGE/$name/"
     chmod +x "$STAGE/$name/smtpmaster"
     tar -czf "$OUTPUT_DIR/$name.tar.gz" -C "$STAGE/$name" \
-        smtpmaster README.md README.vi LICENSE config.example.toml
+        smtpmaster README.md README.vi LICENSE
     info "wrote outputs/$name.tar.gz"
 done
 

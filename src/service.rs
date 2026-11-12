@@ -3,6 +3,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -32,29 +33,37 @@ impl Scope {
 pub struct UnitOptions {
     pub name: String,
     pub exec: PathBuf,
-    pub config: Option<PathBuf>,
     pub environment: Vec<(String, String)>,
     pub scope: Scope,
+    /// Extra `serve` arguments embedded in ExecStart (e.g. `--mongo-uri`).
+    pub extra_args: Vec<String>,
 }
 
 impl UnitOptions {
     pub fn new(
         name: &str,
         exec: PathBuf,
-        config: Option<PathBuf>,
         environment: Vec<(String, String)>,
         scope: Scope,
+        extra_args: Vec<String>,
     ) -> Result<Self> {
         validate_name(name)?;
         for (key, value) in &environment {
             validate_env(key, value)?;
         }
+        for argument in &extra_args {
+            if argument.contains(['\n', '\r', '\0']) {
+                return Err(AppError::Invalid(
+                    "service arguments must not contain newlines".into(),
+                ));
+            }
+        }
         Ok(Self {
             name: name.to_string(),
             exec,
-            config,
             environment,
             scope,
+            extra_args,
         })
     }
 
@@ -94,9 +103,9 @@ impl UnitOptions {
     fn exec_start(&self) -> String {
         let mut command = quote(&self.exec.to_string_lossy());
         command.push_str(" serve");
-        if let Some(config) = &self.config {
-            command.push_str(" --config ");
-            command.push_str(&quote(&config.to_string_lossy()));
+        for argument in &self.extra_args {
+            command.push(' ');
+            command.push_str(&quote(argument));
         }
         command
     }
@@ -155,6 +164,8 @@ pub fn install(options: &UnitOptions, force: bool, no_start: bool, dry_run: bool
         std::fs::create_dir_all(parent).map_err(write_error)?;
     }
     std::fs::write(&path, options.render()).map_err(write_error)?;
+    // Units may embed the MongoDB URI and relay credentials.
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).map_err(write_error)?;
     println!("wrote {}", path.display());
 
     systemctl(options.scope, &["daemon-reload"])?;
@@ -326,19 +337,6 @@ pub fn absolute(path: &Path) -> Result<PathBuf> {
     Ok(absolute.canonicalize().unwrap_or(absolute))
 }
 
-/// Locate the config file to embed in the unit: explicit `--config`, then
-/// `./smtpmaster.toml`.
-pub fn resolve_config(explicit: Option<&Path>) -> Result<Option<PathBuf>> {
-    if let Some(path) = explicit {
-        return Ok(Some(absolute(path)?));
-    }
-    let candidate = Path::new("smtpmaster.toml");
-    if candidate.exists() {
-        return Ok(Some(absolute(candidate)?));
-    }
-    Ok(None)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -347,9 +345,14 @@ mod tests {
         UnitOptions::new(
             "smtpmaster",
             PathBuf::from("/usr/local/bin/smtpmaster"),
-            Some(PathBuf::from("/etc/smtpmaster.toml")),
             parse_environment(&[]).unwrap(),
             scope,
+            vec![
+                "--mongo-db".into(),
+                "smtpmaster".into(),
+                "--listen".into(),
+                "0.0.0.0:2525".into(),
+            ],
         )
         .unwrap()
     }
@@ -358,7 +361,7 @@ mod tests {
     fn renders_system_unit() {
         let unit = options(Scope::System).render();
         assert!(unit.contains(
-            "ExecStart=\"/usr/local/bin/smtpmaster\" serve --config \"/etc/smtpmaster.toml\""
+            "ExecStart=\"/usr/local/bin/smtpmaster\" serve \"--mongo-db\" \"smtpmaster\" \"--listen\" \"0.0.0.0:2525\""
         ));
         assert!(unit.contains("WantedBy=multi-user.target"));
         assert!(unit.contains("Environment=\"SMTPMASTER_LOG=info\""));
@@ -374,13 +377,13 @@ mod tests {
     }
 
     #[test]
-    fn omits_config_when_unset() {
+    fn renders_without_extra_args() {
         let unit = UnitOptions::new(
             "smtpmaster",
             PathBuf::from("/usr/bin/smtpmaster"),
-            None,
             Vec::new(),
             Scope::System,
+            Vec::new(),
         )
         .unwrap()
         .render();
@@ -400,9 +403,9 @@ mod tests {
             UnitOptions::new(
                 "../x",
                 PathBuf::from("/bin/true"),
-                None,
                 Vec::new(),
-                Scope::System
+                Scope::System,
+                Vec::new()
             )
             .is_err()
         );
@@ -410,15 +413,36 @@ mod tests {
             UnitOptions::new(
                 "ok-name",
                 PathBuf::from("/bin/true"),
-                None,
                 Vec::new(),
-                Scope::System
+                Scope::System,
+                Vec::new()
             )
             .is_ok()
         );
         assert!(parse_environment(&["1BAD=x".to_string()]).is_err());
         assert!(parse_environment(&["GOOD".to_string()]).is_err());
         assert!(parse_environment(&["GOOD=a\nb".to_string()]).is_err());
+    }
+
+    #[test]
+    fn embeds_extra_arguments() {
+        let unit = UnitOptions::new(
+            "smtpmaster",
+            PathBuf::from("/usr/bin/smtpmaster"),
+            Vec::new(),
+            Scope::System,
+            vec![
+                "--mongo-uri".into(),
+                "mongodb://db:27017".into(),
+                "--mongo-db".into(),
+                "prod".into(),
+            ],
+        )
+        .unwrap()
+        .render();
+        assert!(unit.contains(
+            "ExecStart=\"/usr/bin/smtpmaster\" serve \"--mongo-uri\" \"mongodb://db:27017\" \"--mongo-db\" \"prod\""
+        ));
     }
 
     #[test]

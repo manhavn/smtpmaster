@@ -26,8 +26,6 @@ pub enum AppError {
     Internal(String),
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
-    #[error("toml error: {0}")]
-    Toml(#[from] toml::de::Error),
 }
 
 impl AppError {

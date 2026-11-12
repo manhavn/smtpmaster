@@ -92,32 +92,93 @@ install -m 0755 smtpmaster ~/.local/bin/
 
 ## Configuration
 
-Copy `config.example.toml` to `smtpmaster.toml` (or pass `--config`). Every
-value can be overridden with `SMTPMASTER_*` environment variables:
-`SMTPMASTER_MONGODB_URI`, `SMTPMASTER_MONGODB_DB`, `SMTPMASTER_LISTEN`,
-`SMTPMASTER_MODE`, `SMTPMASTER_CONCURRENCY`, `SMTPMASTER_SEQUENTIAL`,
-`SMTPMASTER_AUTH_REQUIRED`, `SMTPMASTER_USERS="user:pass,user2:pass2"`,
-`SMTPMASTER_LOG`, …
+There is **no configuration file**. Settings come from built-in defaults, then
+`SMTPMASTER_*` environment variables, then global CLI flags (highest
+precedence). Flags work before or after the subcommand.
 
-```toml
-[mongodb]
-uri = "mongodb://127.0.0.1:27017"
-database = "smtpmaster"
+```sh
+# Minimal: only MongoDB is required
+smtpmaster --mongo-uri "mongodb://127.0.0.1:27017" --mongo-db smtpmaster init
+```
 
-[server]
-listen = "0.0.0.0:2525"
-hostname = "smtpmaster.local"
-mode = "priority"          # priority | round-robin | time-window
-concurrency = 8            # max concurrent upstream sends
-sequential = false         # true = one message at a time
-max_attempts = 0           # 0 = try every eligible account
-fail_threshold = 5
-auth_required = false
-rewrite_from_header = false
+### Every setting
 
-[[server.users]]
-username = "relay"
-password = "change-me"
+| Flag | Environment | Default | Meaning |
+|---|---|---|---|
+| `--mongo-uri <URI>` | `SMTPMASTER_MONGODB_URI` | `mongodb://127.0.0.1:27017` | MongoDB connection string |
+| `--mongo-db <NAME>` | `SMTPMASTER_MONGODB_DB` | `smtpmaster` | MongoDB database |
+| `--listen <ADDR>` | `SMTPMASTER_LISTEN` | `0.0.0.0:2525` | SMTP relay listen address |
+| `--hostname <NAME>` | `SMTPMASTER_HOSTNAME` | `smtpmaster` | SMTP banner / EHLO name |
+| `--mode <MODE>` | `SMTPMASTER_MODE` | `priority` | `priority`, `round-robin` or `time-window` |
+| `--concurrency <N>` | `SMTPMASTER_CONCURRENCY` | `8` | Max concurrent upstream sends |
+| `--sequential[=BOOL]` | `SMTPMASTER_SEQUENTIAL` | `false` | Send one message at a time |
+| `--max-attempts <N>` | `SMTPMASTER_MAX_ATTEMPTS` | `0` | Accounts tried per message; `0` = all eligible |
+| `--fail-threshold <N>` | `SMTPMASTER_FAIL_THRESHOLD` | `5` | Auto-disable after N consecutive failures (`0` = never) |
+| `--send-timeout-secs <N>` | `SMTPMASTER_SEND_TIMEOUT_SECS` | `60` | Upstream SMTP session timeout |
+| `--max-message-size <BYTES>` | `SMTPMASTER_MAX_MESSAGE_SIZE` | `26214400` | Max accepted message size |
+| `--max-recipients <N>` | `SMTPMASTER_MAX_RECIPIENTS` | `100` | Max recipients per message |
+| `--max-connections <N>` | `SMTPMASTER_MAX_CONNECTIONS` | `256` | Max simultaneous client connections |
+| `--auth-required[=BOOL]` | `SMTPMASTER_AUTH_REQUIRED` | `false` | Require AUTH (routes always require it) |
+| `--rewrite-from-header[=BOOL]` | `SMTPMASTER_REWRITE_FROM_HEADER` | `false` | Rewrite `From:` to the selected account |
+| `--relay-user <USER:PASS>` | `SMTPMASTER_USERS` (comma list) | — | Relay credentials; repeatable |
+| `--maintenance-interval-secs <N>` | `SMTPMASTER_MAINTENANCE_INTERVAL_SECS` | `30` | Quota reset / expiry sweep interval |
+| `--log-retention-days <N>` | `SMTPMASTER_LOG_RETENTION_DAYS` | `14` | `send_log` TTL |
+
+`--sequential`, `--auth-required` and `--rewrite-from-header` accept an optional
+value: `--auth-required` means true, `--auth-required=false` turns it off.
+`--relay-user` cannot contain `:` in the username or `,` in either field.
+
+### Full command examples
+
+```sh
+# Serve with every setting spelled out
+smtpmaster \
+  --mongo-uri "mongodb://127.0.0.1:27017" \
+  --mongo-db smtpmaster \
+  --listen 0.0.0.0:2525 \
+  --hostname smtpmaster.local \
+  --mode priority \
+  --concurrency 8 \
+  --sequential=false \
+  --max-attempts 0 \
+  --fail-threshold 5 \
+  --send-timeout-secs 60 \
+  --max-message-size 26214400 \
+  --max-recipients 100 \
+  --max-connections 256 \
+  --auth-required=false \
+  --rewrite-from-header=false \
+  --relay-user relay:change-me \
+  --maintenance-interval-secs 30 \
+  --log-retention-days 14 \
+  serve
+
+# Account with every account option
+smtpmaster account add --name gmail-a --provider google \
+  --host smtp.gmail.com --port 587 --tls starttls \
+  --username bot@example.com --password-env GMAIL_APP_PASSWORD \
+  --from bot@example.com --from-name "Bot A" \
+  --priority 10 --count-max 500 --total-max 50000 --rate-limit 60 \
+  --reset-at 03:30 --timezone Asia/Ho_Chi_Minh \
+  --expires-in 3m \
+  --window "mon-fri 08:00-17:00@1" \
+  --window "sat,sun 10:00-18:00@20"
+
+# Route with every route option
+smtpmaster route add --name app1 --username app1 \
+  --password-env APP1_PASS --description "App 1 pool" \
+  --account gmail-a --account gmail-b
+
+# systemd unit (effective settings are embedded; the unit is mode 0600)
+sudo smtpmaster --mongo-uri "mongodb://127.0.0.1:27017" --mongo-db smtpmaster \
+  --listen 0.0.0.0:2525 --mode priority --concurrency 8 \
+  --max-attempts 0 --auth-required=false \
+  service install --name smtpmaster --force --no-start --env SMTPMASTER_LOG=info
+
+# Dashboard
+smtpmaster admin enable --token "$(openssl rand -hex 24)" --listen 127.0.0.1:8787
+smtpmaster admin status
+smtpmaster admin disable
 ```
 
 ## Managing accounts
@@ -200,7 +261,7 @@ and quota for app1 only affect app1's pool. Without routes, the relay uses
 
 ```sh
 smtpmaster init                 # create indexes, verify MongoDB
-smtpmaster serve                # reads smtpmaster.toml
+smtpmaster serve                # uses flags/env defaults
 smtpmaster serve --mode round-robin --concurrency 16
 smtpmaster serve --sequential   # one message at a time
 ```
@@ -273,7 +334,7 @@ on the command line.
 
 ```sh
 # System unit (needs root), config path embedded in ExecStart
-sudo smtpmaster service install --config /etc/smtpmaster.toml
+sudo smtpmaster --mongo-uri "mongodb://127.0.0.1:27017" --mongo-db smtpmaster service install
 
 # Inspect the generated unit without writing anything
 smtpmaster service print --user
@@ -286,8 +347,9 @@ smtpmaster service status
 sudo smtpmaster service uninstall
 ```
 
-`service install` uses the current binary (or `--bin`), embeds the resolved
-config path, adds `--env KEY=VALUE` variables (default `SMTPMASTER_LOG=info`),
+`service install` uses the current binary (or `--bin`) and embeds the effective
+settings as ExecStart flags plus `Environment=` entries for the MongoDB URI and
+relay users; it also accepts `--env KEY=VALUE` (default `SMTPMASTER_LOG=info`),
 sets `Restart=on-failure`, `LimitNOFILE=65536` and basic hardening. Options:
 `--dry-run`, `--no-start`, `--force`. Alias: `smtpmaster autostart install`.
 
@@ -304,8 +366,8 @@ The script:
    `cargo-zigbuild`).
 3. Builds static musl binaries for `x86_64-unknown-linux-musl` and
    `aarch64-unknown-linux-musl` with `-D warnings` (warning-free).
-4. Verifies the binaries are static, then packages them with both READMEs,
-   LICENSE and the example config.
+4. Verifies the binaries are static, then packages them with both READMEs and
+   LICENSE.
 5. Writes `outputs/SHA256SUMS`, `outputs/mise-tools.toml` and
    `outputs/release-notes.md`.
 
@@ -338,7 +400,7 @@ plus dashboard API and live enable/disable tests.
 ```
 src/
   cli.rs          # clap commands and command handlers
-  config.rs       # TOML + env overrides
+  config.rs       # defaults + env + CLI overrides
   model.rs        # Account, quota window, expiry, admin settings
   route.rs        # inbound identity + outbound account pool
   store.rs        # MongoDB CRUD + atomic reservation
