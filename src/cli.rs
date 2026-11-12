@@ -1,0 +1,946 @@
+//! Command line interface.
+
+use std::io::Read;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+
+use bson::{Bson, Document, oid::ObjectId};
+use chrono::{DateTime, SecondsFormat, Utc};
+use clap::{Args, Parser, Subcommand};
+use tokio::net::TcpListener;
+use tracing_subscriber::EnvFilter;
+
+use crate::config::{Config, SelectionMode, ServerConfig};
+use crate::duration::DurationSpec;
+use crate::error::{AppError, Result};
+use crate::maintenance;
+use crate::model::{Account, Provider, TlsMode, parse_reset_at, validate_timezone};
+use crate::render;
+use crate::router::Router;
+use crate::schedule::{Schedule, parse_window};
+use crate::smtp;
+use crate::store::Store;
+
+#[derive(Debug, Parser)]
+#[command(
+    name = "smtpmaster",
+    version,
+    about = "Route outbound SMTP through MongoDB-managed accounts",
+    propagate_version = true
+)]
+pub struct Cli {
+    /// Configuration file (default: ./smtpmaster.toml when present).
+    #[arg(long, global = true, value_name = "PATH")]
+    config: Option<PathBuf>,
+
+    /// Print machine-readable JSON.
+    #[arg(long, global = true)]
+    json: bool,
+
+    /// Increase log verbosity (-v, -vv).
+    #[arg(short, long, global = true, action = clap::ArgAction::Count)]
+    verbose: u8,
+
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Debug, Subcommand)]
+#[allow(clippy::large_enum_variant)]
+enum Command {
+    /// Create MongoDB indexes and verify connectivity.
+    Init,
+    /// Manage SMTP accounts.
+    Account {
+        #[command(subcommand)]
+        command: AccountCommand,
+    },
+    /// Run the SMTP relay that distributes mail across accounts.
+    Serve(ServeArgs),
+    /// Reset quota windows and disable expired accounts.
+    Maintenance(MaintenanceArgs),
+    /// Show routing statistics.
+    Stats,
+}
+
+#[derive(Debug, Subcommand)]
+enum AccountCommand {
+    /// Add an SMTP account.
+    Add(AddArgs),
+    /// List accounts.
+    List {
+        /// Include disabled accounts (they are listed by default).
+        #[arg(long)]
+        active_only: bool,
+    },
+    /// Show one account.
+    Show { account: String },
+    /// Change an existing account.
+    Update(UpdateArgs),
+    /// Delete an account permanently.
+    Delete {
+        account: String,
+        /// Confirm the deletion.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Enable an account (clears failure counters).
+    Enable { account: String },
+    /// Disable an account without deleting it.
+    Disable {
+        account: String,
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Send a test email through one account.
+    Test {
+        account: String,
+        #[arg(long)]
+        to: String,
+    },
+    /// Reset an account's quota counter immediately.
+    Reset { account: String },
+}
+
+#[derive(Debug, Args)]
+struct AddArgs {
+    /// Unique account name.
+    #[arg(long)]
+    name: String,
+    /// google (smtp.gmail.com preset with app password) or smtp (custom relay).
+    #[arg(long, default_value = "smtp")]
+    provider: Provider,
+    /// SMTP server host (required for --provider smtp).
+    #[arg(long)]
+    host: Option<String>,
+    /// SMTP server port (default: 587, or 465 with --tls implicit).
+    #[arg(long)]
+    port: Option<u16>,
+    /// TLS mode: starttls, implicit or none.
+    #[arg(long)]
+    tls: Option<TlsMode>,
+    #[arg(long)]
+    username: String,
+    /// Password (prefer --password-env or --password-stdin).
+    #[arg(long)]
+    password: Option<String>,
+    /// Read the password from stdin.
+    #[arg(long)]
+    password_stdin: bool,
+    /// Read the password from an environment variable.
+    #[arg(long, value_name = "VAR")]
+    password_env: Option<String>,
+    /// Envelope/From address (defaults to the username when it is an address).
+    #[arg(long)]
+    from: Option<String>,
+    /// Display name used when rewriting the From header.
+    #[arg(long)]
+    from_name: Option<String>,
+    /// Lower is preferred.
+    #[arg(long, default_value_t = 100)]
+    priority: i32,
+    /// Sends per quota window (0 = unlimited).
+    #[arg(long, default_value_t = 0)]
+    count_max: i64,
+    /// Sends per minute (0 = unlimited).
+    #[arg(long, default_value_t = 0)]
+    rate_limit: i64,
+    /// Lifetime send cap for the purchased package (0 = unlimited).
+    #[arg(long, default_value_t = 0)]
+    total_max: i64,
+    /// Daily reset time in the account timezone, HH:MM.
+    #[arg(long, default_value = "00:00")]
+    reset_at: String,
+    /// IANA timezone for the reset time and windows.
+    #[arg(long, default_value = "UTC")]
+    timezone: String,
+    /// Expire after a duration: 15d, 3m (months), 2y, 36h.
+    #[arg(long, conflicts_with = "expires_at")]
+    expires_in: Option<String>,
+    /// Expire at an RFC3339 timestamp.
+    #[arg(long, conflicts_with = "expires_in")]
+    expires_at: Option<String>,
+    /// Usage window: `[days] HH:MM-HH:MM[@priority]`, repeatable.
+    #[arg(long = "window", value_name = "SPEC")]
+    windows: Vec<String>,
+    /// Create the account disabled.
+    #[arg(long)]
+    inactive: bool,
+}
+
+#[derive(Debug, Args)]
+struct UpdateArgs {
+    account: String,
+    /// Rename the account.
+    #[arg(long)]
+    rename: Option<String>,
+    #[arg(long)]
+    host: Option<String>,
+    #[arg(long)]
+    port: Option<u16>,
+    #[arg(long)]
+    tls: Option<TlsMode>,
+    #[arg(long)]
+    username: Option<String>,
+    #[arg(long)]
+    password: Option<String>,
+    #[arg(long)]
+    password_stdin: bool,
+    #[arg(long, value_name = "VAR")]
+    password_env: Option<String>,
+    #[arg(long)]
+    from: Option<String>,
+    #[arg(long)]
+    from_name: Option<String>,
+    #[arg(long)]
+    priority: Option<i32>,
+    #[arg(long)]
+    count_max: Option<i64>,
+    #[arg(long)]
+    rate_limit: Option<i64>,
+    #[arg(long)]
+    total_max: Option<i64>,
+    #[arg(long)]
+    reset_at: Option<String>,
+    #[arg(long)]
+    timezone: Option<String>,
+    #[arg(long, conflicts_with = "expires_at")]
+    expires_in: Option<String>,
+    #[arg(long, conflicts_with = "expires_in")]
+    expires_at: Option<String>,
+    /// Remove the expiration date.
+    #[arg(long)]
+    no_expiry: bool,
+    /// Replace the usage windows, repeatable.
+    #[arg(long = "window", value_name = "SPEC")]
+    windows: Vec<String>,
+    /// Remove all usage windows.
+    #[arg(long)]
+    clear_windows: bool,
+    /// Enable the account.
+    #[arg(long, conflicts_with = "disable")]
+    enable: bool,
+    /// Disable the account.
+    #[arg(long, conflicts_with = "enable")]
+    disable: bool,
+}
+
+#[derive(Debug, Args)]
+struct ServeArgs {
+    #[arg(long)]
+    listen: Option<String>,
+    #[arg(long)]
+    mode: Option<SelectionMode>,
+    #[arg(long)]
+    concurrency: Option<usize>,
+    /// Send one message at a time.
+    #[arg(long)]
+    sequential: bool,
+    #[arg(long)]
+    auth_required: bool,
+    #[arg(long)]
+    rewrite_from_header: bool,
+    #[arg(long)]
+    max_message_size: Option<usize>,
+    #[arg(long)]
+    max_connections: Option<usize>,
+}
+
+#[derive(Debug, Args)]
+struct MaintenanceArgs {
+    /// Keep running instead of doing a single pass.
+    #[arg(long)]
+    watch: bool,
+    /// Seconds between passes in watch mode (default: config value).
+    #[arg(long)]
+    interval: Option<u64>,
+}
+
+pub async fn run() -> Result<()> {
+    let cli = Cli::parse();
+    init_tracing(cli.verbose);
+    let config = Config::load(cli.config.as_deref())?;
+    match cli.command {
+        Command::Init => {
+            let store = connect(&config).await?;
+            store.ensure_indexes().await?;
+            println!(
+                "indexes ready in database `{}` at {}",
+                config.mongodb.database, config.mongodb.uri
+            );
+            Ok(())
+        }
+        Command::Account { command } => handle_account(&config, command, cli.json).await,
+        Command::Serve(args) => serve(config, args).await,
+        Command::Maintenance(args) => {
+            let store = Arc::new(connect(&config).await?);
+            store.ensure_indexes().await?;
+            if args.watch {
+                let interval = args
+                    .interval
+                    .unwrap_or(config.maintenance.interval_secs)
+                    .max(1);
+                maintenance::watch(store, Duration::from_secs(interval)).await;
+                Ok(())
+            } else {
+                let report = store.maintenance(Utc::now()).await?;
+                if cli.json {
+                    print_json(&report)
+                } else {
+                    println!(
+                        "windows reset: {}\naccounts disabled: {}",
+                        report.windows_reset, report.accounts_disabled
+                    );
+                    Ok(())
+                }
+            }
+        }
+        Command::Stats => {
+            let store = connect(&config).await?;
+            let stats = store.stats(Utc::now()).await?;
+            if cli.json {
+                print_json(&stats)
+            } else {
+                let rows = vec![
+                    vec!["accounts".to_string(), stats.total_accounts.to_string()],
+                    vec!["active".to_string(), stats.active_accounts.to_string()],
+                    vec!["expired".to_string(), stats.expired_accounts.to_string()],
+                    vec!["disabled".to_string(), stats.disabled_accounts.to_string()],
+                    vec![
+                        "capped quota used / capacity".to_string(),
+                        format!(
+                            "{} / {}",
+                            stats.used_current_window, stats.capacity_current_window
+                        ),
+                    ],
+                    vec![
+                        "unlimited accounts".to_string(),
+                        stats.unlimited_accounts.to_string(),
+                    ],
+                    vec!["sent (24h)".to_string(), stats.sent_24h.to_string()],
+                    vec!["failed (24h)".to_string(), stats.failed_24h.to_string()],
+                ];
+                render::table(&["METRIC", "VALUE"], &rows);
+                Ok(())
+            }
+        }
+    }
+}
+
+async fn handle_account(config: &Config, command: AccountCommand, json: bool) -> Result<()> {
+    let store = connect(config).await?;
+    match command {
+        AccountCommand::Add(args) => {
+            store.ensure_indexes().await?;
+            let now = Utc::now();
+            let password =
+                resolve_password(&args.password, args.password_stdin, &args.password_env)?
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| {
+                        AppError::Invalid(
+                            "provide --password, --password-stdin or --password-env".into(),
+                        )
+                    })?;
+            if args.username.trim().is_empty() {
+                return Err(AppError::Invalid("--username must not be empty".into()));
+            }
+            if args.count_max < 0 {
+                return Err(AppError::Invalid("--count-max cannot be negative".into()));
+            }
+            if args.rate_limit < 0 {
+                return Err(AppError::Invalid("--rate-limit cannot be negative".into()));
+            }
+            if args.total_max < 0 {
+                return Err(AppError::Invalid("--total-max cannot be negative".into()));
+            }
+            let from = match args.from {
+                Some(from) => from,
+                None if args.username.contains('@') => args.username.clone(),
+                None => {
+                    return Err(AppError::Invalid(
+                        "--from is required when --username is not an email address".into(),
+                    ));
+                }
+            };
+            if !from.contains('@') {
+                return Err(AppError::Invalid(format!(
+                    "`{from}` is not an email address"
+                )));
+            }
+            let mut account =
+                Account::new(args.name, args.provider, args.username, password, from, now);
+            match args.host {
+                Some(host) => account.host = host,
+                None if args.provider == Provider::Custom => {
+                    return Err(AppError::Invalid(
+                        "--host is required for --provider smtp".into(),
+                    ));
+                }
+                None => {}
+            }
+            let tls = args.tls.unwrap_or({
+                if args.port == Some(465) {
+                    TlsMode::Implicit
+                } else {
+                    TlsMode::Starttls
+                }
+            });
+            account.tls = tls;
+            account.port = args
+                .port
+                .unwrap_or(if tls == TlsMode::Implicit { 465 } else { 587 });
+            account.from_name = args.from_name.filter(|name| !name.trim().is_empty());
+            account.priority = args.priority;
+            account.count_max = args.count_max;
+            account.rate_limit_per_min = args.rate_limit;
+            account.rate_tokens = args.rate_limit as f64;
+            account.total_max = args.total_max;
+            account.reset_at = normalize_reset_at(&args.reset_at)?;
+            validate_timezone(&args.timezone)?;
+            account.timezone = args.timezone;
+            account.expires_at =
+                expiry_from_flags(args.expires_in.as_deref(), args.expires_at.as_deref(), now)?;
+            if !args.windows.is_empty() {
+                let windows = args
+                    .windows
+                    .iter()
+                    .map(|spec| parse_window(spec))
+                    .collect::<Result<Vec<_>>>()?;
+                account.schedule = Some(Schedule { windows });
+            }
+            if args.inactive {
+                account.active = false;
+                account.disabled_reason = Some("created inactive".to_string());
+            }
+            account.updated_at = now;
+            store.insert_account(&account).await?;
+
+            if json {
+                print_json(&account.redacted())
+            } else {
+                println!(
+                    "account `{}` created ({}), quota {}, rate {}",
+                    account.name,
+                    account.endpoint_label(),
+                    account.quota_label(),
+                    account.rate_label()
+                );
+                Ok(())
+            }
+        }
+        AccountCommand::List { active_only } => {
+            let accounts = store.list_accounts(active_only).await?;
+            if json {
+                let redacted: Vec<Account> = accounts.iter().map(Account::redacted).collect();
+                print_json(&redacted)
+            } else if accounts.is_empty() {
+                println!("no accounts");
+                Ok(())
+            } else {
+                let now = Utc::now();
+                let headers = render::account_headers();
+                let rows: Vec<Vec<String>> = accounts
+                    .iter()
+                    .map(|account| render::account_row(account, now))
+                    .collect();
+                render::table(&headers, &rows);
+                Ok(())
+            }
+        }
+        AccountCommand::Show { account } => {
+            let account = store.find_account(&account).await?;
+            if json {
+                return print_json(&account.redacted());
+            }
+            let now = Utc::now();
+            let rows = vec![
+                kv("name", account.name.clone()),
+                kv("id", account.id.to_hex()),
+                kv("provider", account.provider.to_string()),
+                kv("status", account.status_label(now)),
+                kv("endpoint", account.endpoint_label()),
+                kv("username", account.username.clone()),
+                kv("password", "***".to_string()),
+                kv("from", from_label(&account)),
+                kv("quota", account.quota_label()),
+                kv("total quota", account.total_label()),
+                kv("rate", account.rate_label()),
+                kv(
+                    "reset",
+                    format!("{} {}", account.reset_at, account.timezone),
+                ),
+                kv("expires", account.expiry_label()),
+                kv("windows", schedule_label(&account.schedule)),
+                kv("total sent", account.total_sent.to_string()),
+                kv(
+                    "last used",
+                    account
+                        .last_used_at
+                        .map(render::format_timestamp)
+                        .unwrap_or_else(|| "-".to_string()),
+                ),
+                kv(
+                    "last success",
+                    account
+                        .last_success_at
+                        .map(render::format_timestamp)
+                        .unwrap_or_else(|| "-".to_string()),
+                ),
+                kv("failures", account.consecutive_failures.to_string()),
+                kv("last error", account.last_error.clone().unwrap_or_default()),
+                kv(
+                    "created",
+                    account
+                        .created_at
+                        .to_rfc3339_opts(SecondsFormat::Secs, true),
+                ),
+                kv(
+                    "updated",
+                    account
+                        .updated_at
+                        .to_rfc3339_opts(SecondsFormat::Secs, true),
+                ),
+            ];
+            for (key, value) in rows {
+                println!("{key:<14}{value}");
+            }
+            Ok(())
+        }
+        AccountCommand::Update(args) => {
+            let account = store.find_account(&args.account).await?;
+            let now = Utc::now();
+            let mut set = Document::new();
+            let mut unset = Document::new();
+
+            if let Some(rename) = args.rename {
+                if rename.trim().is_empty() {
+                    return Err(AppError::Invalid("--rename must not be empty".into()));
+                }
+                set.insert("name", rename);
+            }
+            if let Some(host) = args.host {
+                set.insert("host", host);
+            }
+            if let Some(port) = args.port {
+                set.insert("port", i32::from(port));
+            }
+            if let Some(tls) = args.tls {
+                set.insert("tls", tls.as_str());
+            }
+            if let Some(username) = args.username {
+                if username.trim().is_empty() {
+                    return Err(AppError::Invalid("--username must not be empty".into()));
+                }
+                set.insert("username", username);
+            }
+            if let Some(password) =
+                resolve_password(&args.password, args.password_stdin, &args.password_env)?
+            {
+                if password.is_empty() {
+                    return Err(AppError::Invalid("password must not be empty".into()));
+                }
+                set.insert("password", password);
+            }
+            if let Some(from) = args.from {
+                if !from.contains('@') {
+                    return Err(AppError::Invalid(format!(
+                        "`{from}` is not an email address"
+                    )));
+                }
+                set.insert("from_address", from);
+            }
+            match args.from_name {
+                Some(name) if name.trim().is_empty() => {
+                    unset.insert("from_name", "");
+                }
+                Some(name) => {
+                    set.insert("from_name", name);
+                }
+                None => {}
+            }
+            if let Some(priority) = args.priority {
+                set.insert("priority", priority);
+            }
+            if let Some(count_max) = args.count_max {
+                if count_max < 0 {
+                    return Err(AppError::Invalid("--count-max cannot be negative".into()));
+                }
+                set.insert("count_max", count_max);
+            }
+            if let Some(rate_limit) = args.rate_limit {
+                if rate_limit < 0 {
+                    return Err(AppError::Invalid("--rate-limit cannot be negative".into()));
+                }
+                set.insert("rate_limit_per_min", rate_limit);
+                set.insert("rate_tokens", rate_limit as f64);
+                set.insert("rate_updated_at", bdate(now));
+            }
+            if let Some(total_max) = args.total_max {
+                if total_max < 0 {
+                    return Err(AppError::Invalid("--total-max cannot be negative".into()));
+                }
+                set.insert("total_max", total_max);
+            }
+            if let Some(reset_at) = args.reset_at {
+                set.insert("reset_at", normalize_reset_at(&reset_at)?);
+            }
+            if let Some(timezone) = args.timezone {
+                validate_timezone(&timezone)?;
+                set.insert("timezone", timezone);
+            }
+            if args.no_expiry && (args.expires_in.is_some() || args.expires_at.is_some()) {
+                return Err(AppError::Invalid(
+                    "--no-expiry conflicts with --expires-in/--expires-at".into(),
+                ));
+            }
+            if args.no_expiry {
+                unset.insert("expires_at", "");
+            } else if let Some(expires_at) =
+                expiry_from_flags(args.expires_in.as_deref(), args.expires_at.as_deref(), now)?
+            {
+                set.insert("expires_at", bdate(expires_at));
+            }
+            if args.clear_windows && !args.windows.is_empty() {
+                return Err(AppError::Invalid(
+                    "--clear-windows conflicts with --window".into(),
+                ));
+            }
+            if args.clear_windows {
+                unset.insert("schedule", "");
+            } else if !args.windows.is_empty() {
+                let windows = args
+                    .windows
+                    .iter()
+                    .map(|spec| parse_window(spec))
+                    .collect::<Result<Vec<_>>>()?;
+                let schedule = Schedule { windows };
+                set.insert("schedule", bson_of(&schedule)?);
+            }
+            if args.enable {
+                set.insert("active", true);
+                set.insert("disabled_reason", Bson::Null);
+                set.insert("consecutive_failures", 0i64);
+                set.insert("last_error", Bson::Null);
+            }
+            if args.disable {
+                set.insert("active", false);
+                set.insert(
+                    "disabled_reason",
+                    format!(
+                        "disabled manually at {}",
+                        now.to_rfc3339_opts(SecondsFormat::Secs, true)
+                    ),
+                );
+            }
+            if set.is_empty() && unset.is_empty() {
+                return Err(AppError::Invalid("nothing to update".into()));
+            }
+            set.insert("updated_at", bdate(now));
+
+            let mut update = Document::new();
+            update.insert("$set", set);
+            if !unset.is_empty() {
+                update.insert("$unset", unset);
+            }
+            let updated = store.update_account(account.id, update).await?;
+            if json {
+                print_json(&updated.redacted())
+            } else {
+                println!("account `{}` updated", updated.name);
+                Ok(())
+            }
+        }
+        AccountCommand::Delete { account, yes } => {
+            if !yes {
+                return Err(AppError::Invalid("refusing to delete without --yes".into()));
+            }
+            let account = store.find_account(&account).await?;
+            store.delete_account(account.id).await?;
+            println!("account `{}` deleted", account.name);
+            Ok(())
+        }
+        AccountCommand::Enable { account } => {
+            let account = store.find_account(&account).await?;
+            let updated = store.set_active(account.id, true, None).await?;
+            if json {
+                print_json(&updated.redacted())
+            } else {
+                println!("account `{}` enabled", updated.name);
+                Ok(())
+            }
+        }
+        AccountCommand::Disable { account, reason } => {
+            let account = store.find_account(&account).await?;
+            let reason = reason.unwrap_or_else(|| "disabled manually".to_string());
+            let updated = store.set_active(account.id, false, Some(&reason)).await?;
+            if json {
+                print_json(&updated.redacted())
+            } else {
+                println!("account `{}` disabled: {reason}", updated.name);
+                Ok(())
+            }
+        }
+        AccountCommand::Test { account, to } => {
+            let account = store.find_account(&account).await?;
+            if !to.contains('@') {
+                return Err(AppError::Invalid(format!("`{to}` is not an email address")));
+            }
+            let message = test_message(&account, &to);
+            smtp::send(
+                &account,
+                &account.from_address,
+                std::slice::from_ref(&to),
+                &message,
+                &config.server.hostname,
+                Duration::from_secs(config.server.send_timeout_secs.max(1)),
+            )
+            .await?;
+            println!(
+                "test message delivered to {to} through `{}` ({})",
+                account.name,
+                account.endpoint_label()
+            );
+            Ok(())
+        }
+        AccountCommand::Reset { account } => {
+            let account = store.find_account(&account).await?;
+            let updated = store.reset_usage(&account, Utc::now()).await?;
+            if json {
+                print_json(&updated.redacted())
+            } else {
+                println!(
+                    "quota reset for `{}`: {}",
+                    updated.name,
+                    updated.quota_label()
+                );
+                Ok(())
+            }
+        }
+    }
+}
+
+async fn serve(config: Config, args: ServeArgs) -> Result<()> {
+    let mut server: ServerConfig = config.server.clone();
+    if let Some(listen) = args.listen {
+        server.listen = listen;
+    }
+    if let Some(mode) = args.mode {
+        server.mode = mode;
+    }
+    if let Some(concurrency) = args.concurrency {
+        server.concurrency = concurrency;
+    }
+    if args.sequential {
+        server.sequential = true;
+    }
+    if args.auth_required {
+        server.auth_required = true;
+    }
+    if args.rewrite_from_header {
+        server.rewrite_from_header = true;
+    }
+    if let Some(size) = args.max_message_size {
+        server.max_message_size = size;
+    }
+    if let Some(connections) = args.max_connections {
+        server.max_connections = connections;
+    }
+    if server.auth_required && server.users.is_empty() {
+        return Err(AppError::Config(
+            "authentication is required but no users are configured (see [[server.users]])".into(),
+        ));
+    }
+
+    let store = Arc::new(connect(&config).await?);
+    store.ensure_indexes().await?;
+    let router = Arc::new(Router::new(Arc::clone(&store), &server));
+    let listener = TcpListener::bind(&server.listen).await?;
+    let address = listener.local_addr()?;
+    tracing::info!(
+        %address,
+        mode = %server.mode,
+        workers = if server.sequential { 1 } else { server.concurrency },
+        "smtp router listening"
+    );
+
+    let interval = Duration::from_secs(config.maintenance.interval_secs.max(1));
+    tokio::spawn(maintenance::watch(Arc::clone(&store), interval));
+    tokio::select! {
+        result = crate::smtp::server::serve(listener, router, server) => result,
+        _ = tokio::signal::ctrl_c() => {
+            tracing::info!("shutdown signal received");
+            Ok(())
+        }
+    }
+}
+
+async fn connect(config: &Config) -> Result<Store> {
+    Store::connect(
+        &config.mongodb.uri,
+        &config.mongodb.database,
+        config.log.retention_days,
+    )
+    .await
+}
+
+fn init_tracing(verbose: u8) {
+    let default = match verbose {
+        0 => "info",
+        1 => "debug",
+        _ => "trace",
+    };
+    let filter = EnvFilter::try_from_env("SMTPMASTER_LOG")
+        .unwrap_or_else(|_| EnvFilter::new(format!("smtpmaster={default},warn")));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .try_init();
+}
+
+fn resolve_password(
+    plain: &Option<String>,
+    stdin: bool,
+    env_name: &Option<String>,
+) -> Result<Option<String>> {
+    let sources =
+        usize::from(plain.is_some()) + usize::from(stdin) + usize::from(env_name.is_some());
+    if sources > 1 {
+        return Err(AppError::Invalid(
+            "choose only one of --password, --password-stdin, --password-env".into(),
+        ));
+    }
+    if let Some(password) = plain {
+        return Ok(Some(password.clone()));
+    }
+    if stdin {
+        let mut buffer = String::new();
+        std::io::stdin().read_to_string(&mut buffer)?;
+        return Ok(Some(buffer.trim_end_matches(['\r', '\n']).to_string()));
+    }
+    if let Some(name) = env_name {
+        let value = std::env::var(name)
+            .map_err(|_| AppError::Invalid(format!("environment variable `{name}` is not set")))?;
+        return Ok(Some(value));
+    }
+    Ok(None)
+}
+
+fn expiry_from_flags(
+    expires_in: Option<&str>,
+    expires_at: Option<&str>,
+    now: DateTime<Utc>,
+) -> Result<Option<DateTime<Utc>>> {
+    match (expires_in, expires_at) {
+        (Some(_), Some(_)) => Err(AppError::Invalid(
+            "use either --expires-in or --expires-at".into(),
+        )),
+        (Some(spec), None) => Ok(Some(DurationSpec::parse(spec)?.apply(now)?)),
+        (None, Some(value)) => Ok(Some(parse_timestamp(value)?)),
+        (None, None) => Ok(None),
+    }
+}
+
+fn parse_timestamp(value: &str) -> Result<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value)
+        .map(|dt| dt.with_timezone(&Utc))
+        .map_err(|_| {
+            AppError::Invalid(format!(
+                "`{value}` is not an RFC3339 timestamp (e.g. 2026-12-31T23:59:59Z)"
+            ))
+        })
+}
+
+fn normalize_reset_at(value: &str) -> Result<String> {
+    let (hour, minute) = parse_reset_at(value)?;
+    Ok(format!("{hour:02}:{minute:02}"))
+}
+
+fn bdate(ts: DateTime<Utc>) -> Bson {
+    Bson::DateTime(bson::DateTime::from(ts))
+}
+
+fn bson_of<T: serde::Serialize>(value: &T) -> Result<Bson> {
+    bson::serialize_to_bson(value)
+        .map_err(|error| AppError::Internal(format!("cannot encode value: {error}")))
+}
+
+fn test_message(account: &Account, to: &str) -> Vec<u8> {
+    let from = from_label(account);
+    let message_id = ObjectId::new().to_hex();
+    format!(
+        "From: {from}\r\nTo: {to}\r\nSubject: smtpmaster delivery test\r\nDate: {date}\r\nMessage-ID: <{message_id}@smtpmaster>\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nThis is a delivery test sent by smtpmaster through account {name}.\r\n",
+        date = Utc::now().to_rfc2822(),
+        name = account.name,
+    )
+    .into_bytes()
+}
+
+fn from_label(account: &Account) -> String {
+    match account.from_name.as_deref() {
+        Some(name) if !name.trim().is_empty() => {
+            format!("{name} <{}>", account.from_address)
+        }
+        _ => account.from_address.clone(),
+    }
+}
+
+fn schedule_label(schedule: &Option<Schedule>) -> String {
+    let Some(schedule) = schedule else {
+        return "-".to_string();
+    };
+    if schedule.windows.is_empty() {
+        return "-".to_string();
+    }
+    schedule
+        .windows
+        .iter()
+        .map(|window| {
+            let days = if window.days.is_empty() {
+                "*".to_string()
+            } else {
+                window
+                    .days
+                    .iter()
+                    .map(|day| day_name(*day))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            };
+            let priority = window
+                .priority
+                .map(|value| format!("@{value}"))
+                .unwrap_or_default();
+            format!(
+                "{days} {}-{}{priority}",
+                hhmm(window.start_min),
+                hhmm(window.end_min)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn day_name(day: u8) -> &'static str {
+    match day {
+        0 => "mon",
+        1 => "tue",
+        2 => "wed",
+        3 => "thu",
+        4 => "fri",
+        5 => "sat",
+        _ => "sun",
+    }
+}
+
+fn hhmm(minutes: u32) -> String {
+    format!("{:02}:{:02}", minutes / 60, minutes % 60)
+}
+
+fn kv(key: &str, value: String) -> (String, String) {
+    (key.to_string(), value)
+}
+
+fn print_json<T: serde::Serialize>(value: &T) -> Result<()> {
+    println!("{}", serde_json::to_string_pretty(value)?);
+    Ok(())
+}

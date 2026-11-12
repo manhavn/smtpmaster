@@ -1,0 +1,6 @@
+/target
+/outputs
+/.build
+*.log
+.env
+smtpmaster.toml
