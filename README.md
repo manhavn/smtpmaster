@@ -309,8 +309,10 @@ prints a warning. Put it behind a TLS reverse proxy if exposed.
 
 The dashboard lists MongoDB databases, marks the current server database and
 can create/initialize the smtpmaster schema in a new database. It also shows
-stats, accounts (enable/disable/reset, edit count max, total max, rate limit,
-priority), routes (enable/disable) and the last 50 sends. The running server
+stats, full account CRUD (create/edit/delete, enable/disable/reset, test send,
+quota, rate, priority, reset time, timezone, expiry and usage windows), full
+route CRUD (inbound credentials + outbound pool), maintenance and the last 50
+sends. The running server
 keeps using the database it was started with; create a new one for later use
 with `--mongo-db`. The enabled flag lives in MongoDB and the running `serve` process polls
 it every 2 seconds, so toggling needs **no restart** and does not interrupt

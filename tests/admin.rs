@@ -351,3 +351,127 @@ async fn dashboard_lists_and_creates_databases() {
         .await;
     let _ = store.database().drop().await;
 }
+
+#[tokio::test]
+async fn dashboard_crud_accounts_routes_and_maintenance() {
+    let Some(store) = test_store("smtpmaster_admin_crud").await else {
+        eprintln!("skipping: SMTPMASTER_TEST_MONGO_URI not set");
+        return;
+    };
+    let app = admin::router(Arc::clone(&store), TOKEN.to_string());
+
+    let (status, _) = call(
+        &app,
+        Method::POST,
+        "/api/accounts",
+        Some(TOKEN),
+        Some(json!({
+            "name": "dash-account",
+            "provider": "smtp",
+            "host": "127.0.0.1",
+            "port": 2525,
+            "tls": "none",
+            "username": "u@example.com",
+            "password": "secret",
+            "from_address": "u@example.com",
+            "count_max": 20,
+            "total_max": 100,
+            "rate_limit": 5,
+            "reset_at": "03:30",
+            "timezone": "Asia/Ho_Chi_Minh",
+            "expires_in": "15d",
+            "windows": ["mon-fri 08:00-17:00@2"]
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let created = store.find_account("dash-account").await.unwrap();
+    assert_eq!(created.count_max, 20);
+    assert_eq!(created.total_max, 100);
+    assert_eq!(created.rate_limit_per_min, 5);
+    assert_eq!(created.reset_at, "03:30");
+    assert!(created.schedule.as_ref().unwrap().windows[0].priority == Some(2));
+    assert!(created.expires_at.is_some());
+
+    let (status, _) = call(
+        &app,
+        Method::PATCH,
+        "/api/accounts/dash-account",
+        Some(TOKEN),
+        Some(json!({"count_max": 9, "active": false, "priority": 7})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let updated = store.find_account("dash-account").await.unwrap();
+    assert_eq!(updated.count_max, 9);
+    assert_eq!(updated.priority, 7);
+    assert!(!updated.active);
+
+    let (status, _) = call(
+        &app,
+        Method::POST,
+        "/api/routes",
+        Some(TOKEN),
+        Some(json!({
+            "name": "dash-route",
+            "username": "app-in",
+            "password": "route-secret",
+            "description": "dashboard pool",
+            "accounts": ["dash-account"]
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let route = store.find_route("dash-route").await.unwrap();
+    assert_eq!(route.account_ids, vec![created.id]);
+    assert!(
+        store
+            .authenticate_route("app-in", "route-secret")
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    let (status, _) = call(
+        &app,
+        Method::PATCH,
+        "/api/routes/dash-route",
+        Some(TOKEN),
+        Some(json!({"username": "app-in-2", "accounts": ["dash-account"]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        store.find_route("dash-route").await.unwrap().username,
+        "app-in-2"
+    );
+
+    let (status, body) = call(&app, Method::POST, "/api/maintenance", Some(TOKEN), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.get("windows_reset").is_some());
+
+    let (status, _) = call(
+        &app,
+        Method::DELETE,
+        "/api/routes/dash-route",
+        Some(TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = call(
+        &app,
+        Method::DELETE,
+        "/api/accounts/dash-account",
+        Some(TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(matches!(
+        store.find_account("dash-account").await,
+        Err(smtpmaster::error::AppError::NotFound(_))
+    ));
+
+    let _ = store.database().drop().await;
+}

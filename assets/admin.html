@@ -11,21 +11,25 @@
   header { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; justify-content: space-between;
            padding: 14px 20px; border-bottom: 1px solid color-mix(in srgb, currentColor 18%, transparent); }
   h1 { font-size: 18px; margin: 0; letter-spacing: .2px; }
-  main { padding: 20px; display: grid; gap: 24px; max-width: 1400px; margin: 0 auto; }
+  h2 { margin: 0 0 10px; font-size: 15px; font-weight: 600; }
+  h3 { margin: 14px 0 8px; font-size: 13px; font-weight: 600; opacity: .85; }
+  main { padding: 20px; display: grid; gap: 22px; max-width: 1500px; margin: 0 auto; }
   section { border: 1px solid color-mix(in srgb, currentColor 16%, transparent); border-radius: 10px; padding: 14px 16px; }
-  section h2 { margin: 0 0 10px; font-size: 15px; font-weight: 600; }
   .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-  input, button { font: inherit; padding: 6px 9px; border-radius: 7px;
+  input, select, textarea, button { font: inherit; padding: 6px 9px; border-radius: 7px;
                   border: 1px solid color-mix(in srgb, currentColor 25%, transparent); background: transparent; color: inherit; }
-  input[type=password] { min-width: 220px; }
+  input[type=password] { min-width: 200px; }
   button { cursor: pointer; }
   button:hover { background: color-mix(in srgb, currentColor 10%, transparent); }
   button.danger { border-color: #c0392b; color: #c0392b; }
+  button.primary { border-color: #1e8449; color: #1e8449; }
+  button.small { padding: 3px 7px; font-size: 12px; }
   table { width: 100%; border-collapse: collapse; }
   th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid color-mix(in srgb, currentColor 10%, transparent); vertical-align: middle; }
   th { font-weight: 600; font-size: 12px; text-transform: uppercase; opacity: .7; white-space: nowrap; }
   td.num { font-variant-numeric: tabular-nums; white-space: nowrap; }
-  td input[type=number] { width: 84px; padding: 3px 6px; }
+  td.actions { white-space: nowrap; }
+  td.actions button { margin: 1px; }
   .muted { opacity: .6; }
   .ok { color: #1e8449; }
   .bad { color: #c0392b; }
@@ -36,6 +40,18 @@
   .stats div { min-width: 130px; }
   .stats b { display: block; font-size: 20px; font-variant-numeric: tabular-nums; }
   .scroll { overflow-x: auto; }
+  details { border: 1px dashed color-mix(in srgb, currentColor 22%, transparent); border-radius: 9px; padding: 10px 12px; margin-bottom: 14px; }
+  details summary { cursor: pointer; font-weight: 600; font-size: 13px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(185px, 1fr)); gap: 10px; margin-top: 10px; }
+  label.field { display: flex; flex-direction: column; gap: 3px; font-size: 12px; }
+  label.field > span { opacity: .7; }
+  label.field input, label.field select, label.field textarea { width: 100%; }
+  textarea { min-height: 66px; resize: vertical; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+  .checks { display: flex; flex-wrap: wrap; gap: 6px 14px; margin: 8px 0; }
+  .chk { display: flex; align-items: center; gap: 5px; font-size: 12px; }
+  .checkline { display: flex; align-items: center; gap: 6px; font-size: 12px; margin-top: 8px; }
+  .form-actions { display: flex; gap: 8px; margin-top: 12px; }
+  .hidden { display: none !important; }
 </style>
 </head>
 <body>
@@ -50,7 +66,10 @@
 
 <main>
   <section>
-    <h2>Stats</h2>
+    <div class="row" style="justify-content:space-between">
+      <h2>Stats</h2>
+      <button id="maintenance" class="small">Run maintenance</button>
+    </div>
     <div id="stats" class="stats"><span class="muted">connect to load</span></div>
   </section>
 
@@ -59,7 +78,7 @@
     <p class="muted" style="margin:0 0 10px">Current server database: <b id="current-db">—</b></p>
     <div class="row" style="margin-bottom:10px">
       <input id="new-db" type="text" placeholder="new database name" autocomplete="off">
-      <button id="create-db">Create / initialize</button>
+      <button id="create-db" class="small">Create / initialize</button>
     </div>
     <div class="scroll"><table>
       <thead><tr><th>Database</th><th>Collections</th><th>Current</th></tr></thead>
@@ -69,17 +88,77 @@
 
   <section>
     <h2>Accounts</h2>
+    <details id="account-form-wrap">
+      <summary id="account-form-title">Add SMTP account</summary>
+      <form id="account-form">
+        <div class="grid">
+          <label class="field"><span>Name</span><input id="ac-name" required autocomplete="off"></label>
+          <label class="field"><span>Provider</span>
+            <select id="ac-provider"><option value="smtp">smtp</option><option value="google">google</option></select>
+          </label>
+          <label class="field"><span>Host</span><input id="ac-host" placeholder="smtp.example.com"></label>
+          <label class="field"><span>Port</span><input id="ac-port" type="number" min="1" max="65535" value="587"></label>
+          <label class="field"><span>TLS</span>
+            <select id="ac-tls"><option value="starttls">starttls</option><option value="implicit">implicit</option><option value="none">none</option></select>
+          </label>
+          <label class="field"><span>Username</span><input id="ac-username" autocomplete="off"></label>
+          <label class="field"><span>Password</span><input id="ac-password" type="password" autocomplete="new-password"></label>
+          <label class="field"><span>From address</span><input id="ac-from" placeholder="bot@example.com"></label>
+          <label class="field"><span>From name</span><input id="ac-from-name"></label>
+          <label class="field"><span>Priority</span><input id="ac-priority" type="number" value="100"></label>
+          <label class="field"><span>Count max / window</span><input id="ac-count" type="number" min="0" value="0"></label>
+          <label class="field"><span>Total max (package)</span><input id="ac-total" type="number" min="0" value="0"></label>
+          <label class="field"><span>Rate per minute</span><input id="ac-rate" type="number" min="0" value="0"></label>
+          <label class="field"><span>Reset time (HH:MM)</span><input id="ac-reset" value="00:00"></label>
+          <label class="field"><span>Timezone</span><input id="ac-tz" value="UTC"></label>
+          <label class="field"><span>Expires in (15d, 3m, 2y)</span><input id="ac-expires-in" placeholder="optional"></label>
+          <label class="field"><span>Expires at (RFC3339)</span><input id="ac-expires-at" placeholder="2027-01-01T00:00:00Z"></label>
+        </div>
+        <label class="field" style="margin-top:10px"><span>Usage windows — one per line: [days] HH:MM-HH:MM[@priority]</span>
+          <textarea id="ac-windows" placeholder="mon-fri 08:00-17:00@1"></textarea>
+        </label>
+        <div class="row" style="margin-top:8px">
+          <label class="checkline"><input id="ac-active" type="checkbox" checked> active</label>
+          <label class="checkline"><input id="ac-clear-expiry" type="checkbox"> clear expiry</label>
+          <label class="checkline"><input id="ac-clear-windows" type="checkbox"> clear windows</label>
+        </div>
+        <div class="form-actions">
+          <button type="submit" class="primary" id="ac-submit">Create account</button>
+          <button type="button" id="ac-cancel">Cancel</button>
+        </div>
+      </form>
+    </details>
+
     <div class="scroll"><table>
       <thead><tr>
-        <th>Name</th><th>Status</th><th>Quota</th><th>Total</th><th>Rate/min</th>
-        <th>Priority</th><th>Count max</th><th>Total max</th><th>Actions</th>
+        <th>Name</th><th>Status</th><th>Endpoint</th><th>Quota</th><th>Total</th>
+        <th>Rate</th><th>Priority</th><th>Reset</th><th>Expires</th><th>Actions</th>
       </tr></thead>
-      <tbody id="accounts"><tr><td colspan="9" class="muted">—</td></tr></tbody>
+      <tbody id="accounts"><tr><td colspan="10" class="muted">—</td></tr></tbody>
     </table></div>
   </section>
 
   <section>
-    <h2>Routes</h2>
+    <h2>Routes / outbound pools</h2>
+    <details id="route-form-wrap">
+      <summary id="route-form-title">Add route</summary>
+      <form id="route-form">
+        <div class="grid">
+          <label class="field"><span>Name</span><input id="rt-name" required autocomplete="off"></label>
+          <label class="field"><span>Inbound username</span><input id="rt-username" autocomplete="off"></label>
+          <label class="field"><span>Inbound password</span><input id="rt-password" type="password" autocomplete="new-password"></label>
+          <label class="field"><span>Description</span><input id="rt-description"></label>
+        </div>
+        <h3>Outbound accounts</h3>
+        <div id="rt-accounts" class="checks"><span class="muted">no accounts yet</span></div>
+        <label class="checkline"><input id="rt-active" type="checkbox" checked> active</label>
+        <div class="form-actions">
+          <button type="submit" class="primary" id="rt-submit">Create route</button>
+          <button type="button" id="rt-cancel">Cancel</button>
+        </div>
+      </form>
+    </details>
+
     <div class="scroll"><table>
       <thead><tr><th>Name</th><th>Inbound user</th><th>Status</th><th>Outbound pool</th><th>Actions</th></tr></thead>
       <tbody id="routes"><tr><td colspan="5" class="muted">—</td></tr></tbody>
@@ -100,6 +179,12 @@ const tokenInput = document.getElementById('token');
 const statusEl = document.getElementById('status');
 let token = localStorage.getItem('smtpmaster_token') || '';
 let timer = null;
+let accountsCache = [];
+let routesCache = [];
+let editingAccount = null;
+let editingRoute = null;
+
+const DAYS = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'];
 
 function escapeHtml(value) {
   return String(value ?? '').replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -119,6 +204,35 @@ async function api(path, options = {}) {
   }
   return response.json();
 }
+function hhmm(minutes) {
+  return String(Math.floor(minutes / 60)).padStart(2, '0') + ':' + String(minutes % 60).padStart(2, '0');
+}
+function windowSpec(window) {
+  const days = (!window.days || !window.days.length) ? '*' : window.days.map((d) => DAYS[d] || d).join(',');
+  const priority = (window.priority === null || window.priority === undefined) ? '' : '@' + window.priority;
+  return `${days} ${hhmm(window.start_min)}-${hhmm(window.end_min)}${priority}`;
+}
+function dateFromExtended(value) {
+  if (!value) return null;
+  if (typeof value === 'string') return new Date(value);
+  if (value.$date) {
+    const raw = value.$date;
+    const millis = typeof raw === 'object' ? Number(raw.$numberLong) : Number(raw);
+    if (!Number.isNaN(millis)) return new Date(millis);
+  }
+  return null;
+}
+function dateLabel(value) {
+  const date = dateFromExtended(value);
+  if (!date || Number.isNaN(date.getTime())) return '-';
+  return date.toLocaleString();
+}
+function dateInput(value) {
+  const date = dateFromExtended(value);
+  if (!date || Number.isNaN(date.getTime())) return '';
+  return date.toISOString();
+}
+
 function statCard(label, value) {
   return `<div><b>${escapeHtml(value)}</b><span class="muted">${escapeHtml(label)}</span></div>`;
 }
@@ -134,31 +248,6 @@ function renderStats(s) {
     statCard('failed 24h', s.failed_24h),
   ].join('');
 }
-function renderAccounts(accounts) {
-  const body = document.getElementById('accounts');
-  if (!accounts.length) { body.innerHTML = '<tr><td colspan="9" class="muted">no accounts</td></tr>'; return; }
-  body.innerHTML = accounts.map((a) => {
-    const active = a.active ? '<span class="pill ok">active</span>' : '<span class="pill bad">off</span>';
-    const quota = a.count_max > 0 ? `${a.count_used}/${a.count_max}` : `${a.count_used}/∞`;
-    const total = a.total_max > 0 ? `${a.total_sent}/${a.total_max}` : `${a.total_sent}/∞`;
-    const action = a.active ? 'disable' : 'enable';
-    return `<tr>
-      <td>${escapeHtml(a.name)}</td>
-      <td>${active}</td>
-      <td class="num">${escapeHtml(quota)}</td>
-      <td class="num">${escapeHtml(total)}</td>
-      <td class="num">${escapeHtml(a.rate_limit_per_min || '∞')}</td>
-      <td class="num">${escapeHtml(a.priority)}</td>
-      <td><input type="number" min="0" step="1" value="${escapeHtml(a.count_max)}" data-field="count_max" data-account="${escapeHtml(a.name)}"></td>
-      <td><input type="number" min="0" step="1" value="${escapeHtml(a.total_max)}" data-field="total_max" data-account="${escapeHtml(a.name)}"></td>
-      <td class="row">
-        <button data-action="${action}" data-account="${escapeHtml(a.name)}">${action}</button>
-        <button data-action="save" data-account="${escapeHtml(a.name)}">save</button>
-        <button data-action="reset" data-account="${escapeHtml(a.name)}">reset</button>
-      </td>
-    </tr>`;
-  }).join('');
-}
 function renderDatabases(data) {
   document.getElementById('current-db').textContent = data.current || '—';
   const databases = data.databases || [];
@@ -173,25 +262,89 @@ function renderDatabases(data) {
     <td>${database.current ? '<span class="pill ok">yes</span>' : ''}</td>
   </tr>`).join('');
 }
-function renderRoutes(routes) {
-  const body = document.getElementById('routes');
-  if (!routes.length) { body.innerHTML = '<tr><td colspan="5" class="muted">no routes (legacy global pool)</td></tr>'; return; }
-  body.innerHTML = routes.map((r) => {
-    const active = r.active ? '<span class="pill ok">active</span>' : '<span class="pill bad">off</span>';
-    const pool = (r.accounts || []).map((a) => a.name || ('missing:' + a.id)).join(', ') || '—';
-    const action = r.active ? 'disable' : 'enable';
+function accountStatus(account) {
+  const expires = dateFromExtended(account.expires_at);
+  if (expires && expires.getTime() <= Date.now()) return '<span class="pill bad">expired</span>';
+  return account.active ? '<span class="pill ok">active</span>' : '<span class="pill bad">off</span>';
+}
+function renderAccounts(accounts) {
+  accountsCache = accounts;
+  const body = document.getElementById('accounts');
+  if (!accounts.length) {
+    body.innerHTML = '<tr><td colspan="10" class="muted">no accounts yet</td></tr>';
+    renderPoolChecks([]);
+    return;
+  }
+  body.innerHTML = accounts.map((a) => {
+    const quota = a.count_max > 0 ? `${a.count_used}/${a.count_max}` : `${a.count_used}/∞`;
+    const total = a.total_max > 0 ? `${a.total_sent}/${a.total_max}` : `${a.total_sent}/∞`;
+    const toggle = a.active ? 'disable' : 'enable';
     return `<tr>
-      <td>${escapeHtml(r.name)}</td>
-      <td>${escapeHtml(r.username)}</td>
-      <td>${active}</td>
+      <td>${escapeHtml(a.name)}</td>
+      <td>${accountStatus(a)}</td>
+      <td class="muted">${escapeHtml(a.host)}:${escapeHtml(a.port)} (${escapeHtml(a.tls)})</td>
+      <td class="num">${escapeHtml(quota)}</td>
+      <td class="num">${escapeHtml(total)}</td>
+      <td class="num">${escapeHtml(a.rate_limit_per_min || '∞')}</td>
+      <td class="num">${escapeHtml(a.priority)}</td>
+      <td class="num">${escapeHtml(a.reset_at)} ${escapeHtml(a.timezone)}</td>
+      <td class="num">${escapeHtml(dateLabel(a.expires_at))}</td>
+      <td class="actions">
+        <button class="small" data-acc-action="edit" data-account="${escapeHtml(a.name)}">edit</button>
+        <button class="small" data-acc-action="${toggle}" data-account="${escapeHtml(a.name)}">${toggle}</button>
+        <button class="small" data-acc-action="reset" data-account="${escapeHtml(a.name)}">reset</button>
+        <button class="small" data-acc-action="test" data-account="${escapeHtml(a.name)}">test</button>
+        <button class="small danger" data-acc-action="delete" data-account="${escapeHtml(a.name)}">delete</button>
+      </td>
+    </tr>`;
+  }).join('');
+  renderPoolChecks(selectedPool());
+}
+function selectedPool() {
+  if (!editingRoute) return [];
+  const route = routesCache.find((r) => r.name === editingRoute);
+  return (route?.accounts || []).map((a) => a.name).filter(Boolean);
+}
+function renderPoolChecks(selected) {
+  const container = document.getElementById('rt-accounts');
+  if (!accountsCache.length) {
+    container.innerHTML = '<span class="muted">no accounts yet — create an account first</span>';
+    return;
+  }
+  container.innerHTML = accountsCache.map((account) => `<label class="chk">
+    <input type="checkbox" value="${escapeHtml(account.name)}" ${selected.includes(account.name) ? 'checked' : ''}>
+    ${escapeHtml(account.name)}
+  </label>`).join('');
+}
+function renderRoutes(routes) {
+  routesCache = routes;
+  const body = document.getElementById('routes');
+  if (!routes.length) {
+    body.innerHTML = '<tr><td colspan="5" class="muted">no routes (legacy global pool)</td></tr>';
+    return;
+  }
+  body.innerHTML = routes.map((route) => {
+    const toggle = route.active ? 'disable' : 'enable';
+    const pool = (route.accounts || []).map((a) => a.name || ('missing:' + a.id)).join(', ') || '—';
+    return `<tr>
+      <td>${escapeHtml(route.name)}</td>
+      <td>${escapeHtml(route.username)}</td>
+      <td>${route.active ? '<span class="pill ok">active</span>' : '<span class="pill bad">off</span>'}</td>
       <td>${escapeHtml(pool)}</td>
-      <td><button data-action="${action}" data-route="${escapeHtml(r.name)}">${action}</button></td>
+      <td class="actions">
+        <button class="small" data-rt-action="edit" data-route="${escapeHtml(route.name)}">edit</button>
+        <button class="small" data-rt-action="${toggle}" data-route="${escapeHtml(route.name)}">${toggle}</button>
+        <button class="small danger" data-rt-action="delete" data-route="${escapeHtml(route.name)}">delete</button>
+      </td>
     </tr>`;
   }).join('');
 }
 function renderLogs(logs) {
   const body = document.getElementById('logs');
-  if (!logs.length) { body.innerHTML = '<tr><td colspan="5" class="muted">no sends yet</td></tr>'; return; }
+  if (!logs.length) {
+    body.innerHTML = '<tr><td colspan="5" class="muted">no sends yet</td></tr>';
+    return;
+  }
   body.innerHTML = logs.map((l) => `<tr>
     <td class="num">${escapeHtml(new Date(l.ts).toLocaleString())}</td>
     <td>${escapeHtml(l.account)}</td>
@@ -217,29 +370,200 @@ async function refresh() {
     setStatus(error.message, true);
   }
 }
-async function accountAction(action, name) {
+
+function resetAccountForm() {
+  editingAccount = null;
+  document.getElementById('account-form').reset();
+  document.getElementById('ac-name').disabled = false;
+  document.getElementById('ac-provider').value = 'smtp';
+  document.getElementById('ac-port').value = '587';
+  document.getElementById('ac-tls').value = 'starttls';
+  document.getElementById('ac-priority').value = '100';
+  document.getElementById('ac-reset').value = '00:00';
+  document.getElementById('ac-tz').value = 'UTC';
+  document.getElementById('ac-active').checked = true;
+  document.getElementById('ac-clear-expiry').checked = false;
+  document.getElementById('ac-clear-windows').checked = false;
+  document.getElementById('ac-password').placeholder = '';
+  document.getElementById('account-form-title').textContent = 'Add SMTP account';
+  document.getElementById('ac-submit').textContent = 'Create account';
+}
+function editAccount(name) {
+  const account = accountsCache.find((a) => a.name === name);
+  if (!account) return;
+  editingAccount = name;
+  const set = (id, value) => { document.getElementById(id).value = value ?? ''; };
+  set('ac-name', account.name);
+  document.getElementById('ac-name').disabled = true;
+  set('ac-provider', account.provider === 'google' ? 'google' : 'smtp');
+  set('ac-host', account.host);
+  set('ac-port', account.port);
+  set('ac-tls', account.tls);
+  set('ac-username', account.username);
+  set('ac-password', '');
+  document.getElementById('ac-password').placeholder = 'leave blank to keep';
+  set('ac-from', account.from_address);
+  set('ac-from-name', account.from_name || '');
+  set('ac-priority', account.priority);
+  set('ac-count', account.count_max);
+  set('ac-total', account.total_max);
+  set('ac-rate', account.rate_limit_per_min);
+  set('ac-reset', account.reset_at);
+  set('ac-tz', account.timezone);
+  set('ac-expires-in', '');
+  set('ac-expires-at', dateInput(account.expires_at));
+  set('ac-windows', (account.schedule?.windows || []).map(windowSpec).join('\n'));
+  document.getElementById('ac-active').checked = Boolean(account.active);
+  document.getElementById('ac-clear-expiry').checked = false;
+  document.getElementById('ac-clear-windows').checked = false;
+  document.getElementById('account-form-title').textContent = 'Edit account: ' + name;
+  document.getElementById('ac-submit').textContent = 'Save account';
+  document.getElementById('account-form-wrap').open = true;
+  document.getElementById('account-form-wrap').scrollIntoView({behavior: 'smooth', block: 'start'});
+}
+document.getElementById('account-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
   try {
-    if (action === 'enable' || action === 'disable' || action === 'reset') {
-      await api(`/api/accounts/${encodeURIComponent(name)}/${action}`, {method: 'POST'});
-    } else if (action === 'save') {
-      const body = {};
-      document.querySelectorAll(`input[data-account="${CSS.escape(name)}"]`).forEach((input) => {
-        body[input.dataset.field] = Number(input.value);
-      });
-      await api(`/api/accounts/${encodeURIComponent(name)}`, {method: 'PATCH', body: JSON.stringify(body)});
+    const body = {
+      name: document.getElementById('ac-name').value.trim(),
+      provider: document.getElementById('ac-provider').value,
+      host: document.getElementById('ac-host').value.trim(),
+      port: Number(document.getElementById('ac-port').value || 587),
+      tls: document.getElementById('ac-tls').value,
+      username: document.getElementById('ac-username').value.trim(),
+      password: document.getElementById('ac-password').value,
+      from_address: document.getElementById('ac-from').value.trim(),
+      from_name: document.getElementById('ac-from-name').value,
+      priority: Number(document.getElementById('ac-priority').value || 100),
+      count_max: Number(document.getElementById('ac-count').value || 0),
+      total_max: Number(document.getElementById('ac-total').value || 0),
+      rate_limit: Number(document.getElementById('ac-rate').value || 0),
+      reset_at: document.getElementById('ac-reset').value.trim(),
+      timezone: document.getElementById('ac-tz').value.trim(),
+      expires_in: document.getElementById('ac-expires-in').value.trim(),
+      expires_at: document.getElementById('ac-expires-at').value.trim(),
+      windows: document.getElementById('ac-windows').value.split('\n').map((s) => s.trim()).filter(Boolean),
+      active: document.getElementById('ac-active').checked,
+    };
+    if (editingAccount) {
+      delete body.name;
+      delete body.provider;
+      if (!body.password) delete body.password;
+      if (!body.expires_in && !body.expires_at) { delete body.expires_in; delete body.expires_at; }
+      if (document.getElementById('ac-clear-expiry').checked) body.clear_expiry = true;
+      if (!body.windows.length) {
+        if (document.getElementById('ac-clear-windows').checked) body.windows = [];
+        else delete body.windows;
+      }
+      await api(`/api/accounts/${encodeURIComponent(editingAccount)}`, {method: 'PATCH', body: JSON.stringify(body)});
+      setStatus('account updated: ' + editingAccount, false);
+    } else {
+      if (!body.name) throw new Error('name is required');
+      await api('/api/accounts', {method: 'POST', body: JSON.stringify(body)});
+      setStatus('account created: ' + body.name, false);
     }
+    resetAccountForm();
     await refresh();
   } catch (error) { setStatus(error.message, true); }
+});
+document.getElementById('ac-cancel').addEventListener('click', resetAccountForm);
+
+function resetRouteForm() {
+  editingRoute = null;
+  document.getElementById('route-form').reset();
+  document.getElementById('rt-name').disabled = false;
+  document.getElementById('rt-active').checked = true;
+  document.getElementById('route-form-title').textContent = 'Add route';
+  document.getElementById('rt-submit').textContent = 'Create route';
+  renderPoolChecks([]);
 }
-document.addEventListener('click', (event) => {
+function editRoute(name) {
+  const route = routesCache.find((r) => r.name === name);
+  if (!route) return;
+  editingRoute = name;
+  document.getElementById('rt-name').value = route.name;
+  document.getElementById('rt-name').disabled = true;
+  document.getElementById('rt-username').value = route.username;
+  document.getElementById('rt-password').value = '';
+  document.getElementById('rt-password').placeholder = 'leave blank to keep';
+  document.getElementById('rt-description').value = route.description || '';
+  document.getElementById('rt-active').checked = Boolean(route.active);
+  renderPoolChecks((route.accounts || []).map((a) => a.name).filter(Boolean));
+  document.getElementById('route-form-title').textContent = 'Edit route: ' + name;
+  document.getElementById('rt-submit').textContent = 'Save route';
+  document.getElementById('route-form-wrap').open = true;
+  document.getElementById('route-form-wrap').scrollIntoView({behavior: 'smooth', block: 'start'});
+}
+document.getElementById('route-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  try {
+    const accounts = [...document.querySelectorAll('#rt-accounts input:checked')].map((input) => input.value);
+    if (!accounts.length) throw new Error('select at least one outbound account');
+    const body = {
+      name: document.getElementById('rt-name').value.trim(),
+      username: document.getElementById('rt-username').value.trim(),
+      password: document.getElementById('rt-password').value,
+      description: document.getElementById('rt-description').value,
+      accounts,
+      active: document.getElementById('rt-active').checked,
+    };
+    if (editingRoute) {
+      delete body.name;
+      if (!body.password) delete body.password;
+      await api(`/api/routes/${encodeURIComponent(editingRoute)}`, {method: 'PATCH', body: JSON.stringify(body)});
+      setStatus('route updated: ' + editingRoute, false);
+    } else {
+      if (!body.name) throw new Error('name is required');
+      await api('/api/routes', {method: 'POST', body: JSON.stringify(body)});
+      setStatus('route created: ' + body.name, false);
+    }
+    resetRouteForm();
+    await refresh();
+  } catch (error) { setStatus(error.message, true); }
+});
+document.getElementById('rt-cancel').addEventListener('click', resetRouteForm);
+
+document.addEventListener('click', async (event) => {
   const button = event.target.closest('button');
   if (!button) return;
-  if (button.dataset.account) accountAction(button.dataset.action, button.dataset.account);
-  if (button.dataset.route) {
-    api(`/api/routes/${encodeURIComponent(button.dataset.route)}/${button.dataset.action}`, {method: 'POST'})
-      .then(refresh).catch((error) => setStatus(error.message, true));
-  }
+  const accAction = button.dataset.accAction;
+  const account = button.dataset.account;
+  const rtAction = button.dataset.rtAction;
+  const route = button.dataset.route;
+  try {
+    if (accAction && account) {
+      if (accAction === 'edit') return editAccount(account);
+      if (accAction === 'delete') {
+        if (!confirm(`Delete account "${account}" permanently?`)) return;
+        await api(`/api/accounts/${encodeURIComponent(account)}`, {method: 'DELETE'});
+        setStatus('account deleted: ' + account, false);
+      } else if (accAction === 'test') {
+        const to = prompt(`Send a test email through "${account}" to:`);
+        if (!to) return;
+        setStatus('sending test through ' + account + '...', false);
+        await api(`/api/accounts/${encodeURIComponent(account)}/test`, {method: 'POST', body: JSON.stringify({to})});
+        setStatus('test delivered through ' + account + ' to ' + to, false);
+      } else if (['enable', 'disable', 'reset'].includes(accAction)) {
+        await api(`/api/accounts/${encodeURIComponent(account)}/${accAction}`, {method: 'POST'});
+        setStatus(`account ${accAction}d: ${account}`, false);
+      }
+      await refresh();
+    }
+    if (rtAction && route) {
+      if (rtAction === 'edit') return editRoute(route);
+      if (rtAction === 'delete') {
+        if (!confirm(`Delete route "${route}"?`)) return;
+        await api(`/api/routes/${encodeURIComponent(route)}`, {method: 'DELETE'});
+        setStatus('route deleted: ' + route, false);
+      } else if (['enable', 'disable'].includes(rtAction)) {
+        await api(`/api/routes/${encodeURIComponent(route)}/${rtAction}`, {method: 'POST'});
+        setStatus(`route ${rtAction}d: ${route}`, false);
+      }
+      await refresh();
+    }
+  } catch (error) { setStatus(error.message, true); }
 });
+
 document.getElementById('create-db').addEventListener('click', async () => {
   const input = document.getElementById('new-db');
   const name = input.value.trim();
@@ -248,6 +572,13 @@ document.getElementById('create-db').addEventListener('click', async () => {
     await api('/api/databases', {method: 'POST', body: JSON.stringify({name})});
     input.value = '';
     setStatus('database initialized: ' + name, false);
+    await refresh();
+  } catch (error) { setStatus(error.message, true); }
+});
+document.getElementById('maintenance').addEventListener('click', async () => {
+  try {
+    const report = await api('/api/maintenance', {method: 'POST'});
+    setStatus(`maintenance: ${report.windows_reset} windows reset, ${report.accounts_disabled} accounts disabled`, false);
     await refresh();
   } catch (error) { setStatus(error.message, true); }
 });
