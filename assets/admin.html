@@ -18,6 +18,10 @@
   .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
   input, select, textarea, button { font: inherit; padding: 6px 9px; border-radius: 7px;
                   border: 1px solid color-mix(in srgb, currentColor 25%, transparent); background: transparent; color: inherit; }
+  /* Native <select> popups do not inherit the transparent field styling; use
+     system colors so options stay readable in both light and dark mode. */
+  select, option, optgroup { background-color: Canvas; color: CanvasText; }
+  select { color-scheme: light dark; }
   input[type=password] { min-width: 200px; }
   button { cursor: pointer; }
   button:hover { background: color-mix(in srgb, currentColor 10%, transparent); }
