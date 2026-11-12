@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use bson::oid::ObjectId;
 use tokio::io::{AsyncBufRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
@@ -15,12 +16,18 @@ use crate::config::ServerConfig;
 use crate::error::{AppError, Result};
 use crate::router::Router;
 use crate::smtp::protocol::{self, MAX_LINE};
+use crate::store::Store;
 
 const SESSION_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_AUTH_FAILURES: u8 = 3;
 
 /// Serve accepted connections until the listener errors out or is dropped.
-pub async fn serve(listener: TcpListener, router: Arc<Router>, config: ServerConfig) -> Result<()> {
+pub async fn serve(
+    listener: TcpListener,
+    router: Arc<Router>,
+    store: Arc<Store>,
+    config: ServerConfig,
+) -> Result<()> {
     let config = Arc::new(config);
     let connections = Arc::new(Semaphore::new(config.max_connections.max(1)));
     loop {
@@ -40,11 +47,12 @@ pub async fn serve(listener: TcpListener, router: Arc<Router>, config: ServerCon
             }
         };
         let router = Arc::clone(&router);
+        let store = Arc::clone(&store);
         let config = Arc::clone(&config);
         tokio::spawn(async move {
             let _permit = permit;
             debug!(%peer, "client connected");
-            if let Err(error) = handle(stream, router, config).await {
+            if let Err(error) = handle(stream, router, store, config).await {
                 debug!(%peer, error = %error, "session closed");
             }
             debug!(%peer, "client disconnected");
@@ -63,12 +71,25 @@ struct Session {
     transaction: Transaction,
     authenticated: bool,
     auth_failures: u8,
+    /// Route bound by a successful inbound AUTH, when routes are configured.
+    route_id: Option<ObjectId>,
+    /// Routes exist in the database: AUTH is mandatory and tenant-scoped.
+    routes_enabled: bool,
 }
 
-async fn handle(stream: TcpStream, router: Arc<Router>, config: Arc<ServerConfig>) -> Result<()> {
+async fn handle(
+    stream: TcpStream,
+    router: Arc<Router>,
+    store: Arc<Store>,
+    config: Arc<ServerConfig>,
+) -> Result<()> {
     let _ = stream.set_nodelay(true);
     let mut stream = BufReader::new(stream);
-    let mut session = Session::default();
+    let routes_enabled = store.routes_active().await?;
+    let mut session = Session {
+        routes_enabled,
+        ..Session::default()
+    };
 
     reply(
         &mut stream,
@@ -94,7 +115,7 @@ async fn handle(stream: TcpStream, router: Arc<Router>, config: Arc<ServerConfig
                 let mut response = format!("250-{}\r\n", config.hostname);
                 response.push_str("250-8BITMIME\r\n");
                 response.push_str("250-PIPELINING\r\n");
-                if !config.users.is_empty() {
+                if !config.users.is_empty() || session.routes_enabled {
                     response.push_str("250-AUTH PLAIN LOGIN\r\n");
                 }
                 response.push_str(&format!("250 SIZE {}\r\n", config.max_message_size));
@@ -105,7 +126,7 @@ async fn handle(stream: TcpStream, router: Arc<Router>, config: Arc<ServerConfig
                 reply(&mut stream, &format!("250 {}", config.hostname)).await?;
             }
             "AUTH" => {
-                if config.users.is_empty() {
+                if config.users.is_empty() && !session.routes_enabled {
                     reply(&mut stream, "503 5.5.1 AUTH is not enabled").await?;
                     continue;
                 }
@@ -115,12 +136,26 @@ async fn handle(stream: TcpStream, router: Arc<Router>, config: Arc<ServerConfig
                 }
                 match authenticate(&mut stream, &rest).await {
                     Ok(Some((username, password))) => {
-                        let valid = config
-                            .users
-                            .iter()
-                            .any(|user| user.username == username && user.password == password);
+                        let (valid, route_id) = if session.routes_enabled {
+                            match store.authenticate_route(&username, &password).await {
+                                Ok(Some(route)) => (true, Some(route.id)),
+                                Ok(None) => (false, None),
+                                Err(error) => {
+                                    debug!(error = %error, "route lookup failed");
+                                    (false, None)
+                                }
+                            }
+                        } else {
+                            (
+                                config.users.iter().any(|user| {
+                                    user.username == username && user.password == password
+                                }),
+                                None,
+                            )
+                        };
                         if valid {
                             session.authenticated = true;
+                            session.route_id = route_id;
                             reply(&mut stream, "235 2.7.0 Authentication successful").await?;
                         } else {
                             session.auth_failures += 1;
@@ -141,7 +176,7 @@ async fn handle(stream: TcpStream, router: Arc<Router>, config: Arc<ServerConfig
                 }
             }
             "MAIL" => {
-                if config.auth_required && !session.authenticated {
+                if (config.auth_required || session.routes_enabled) && !session.authenticated {
                     reply(&mut stream, "530 5.7.0 Authentication required").await?;
                     continue;
                 }
@@ -205,7 +240,10 @@ async fn handle(stream: TcpStream, router: Arc<Router>, config: Arc<ServerConfig
                 };
                 let recipients = std::mem::take(&mut session.transaction.recipients);
                 session.transaction.mail_from = None;
-                match router.dispatch(&mail_from, &recipients, &raw).await {
+                match router
+                    .dispatch(session.route_id, &mail_from, &recipients, &raw)
+                    .await
+                {
                     Ok(delivery) => {
                         info!(
                             account = %delivery.account_name,

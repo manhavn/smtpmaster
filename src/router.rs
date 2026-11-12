@@ -1,6 +1,7 @@
 //! Routes each incoming message to one account with remaining capacity.
 
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
@@ -30,6 +31,9 @@ pub struct Router {
     hostname: String,
     rewrite_from_header: bool,
     permits: Arc<Semaphore>,
+    /// One permit per account so a single account never sends two messages at
+    /// once; idle accounts are used in parallel instead.
+    account_slots: Mutex<HashMap<ObjectId, Arc<Semaphore>>>,
 }
 
 impl Router {
@@ -37,7 +41,7 @@ impl Router {
         Self {
             store,
             mode: config.mode,
-            max_attempts: config.max_attempts.max(1),
+            max_attempts: config.max_attempts,
             fail_threshold: config.fail_threshold,
             timeout: Duration::from_secs(config.send_timeout_secs.max(1)),
             hostname: config.hostname.clone(),
@@ -47,11 +51,25 @@ impl Router {
             } else {
                 config.concurrency.max(1)
             })),
+            account_slots: Mutex::new(HashMap::new()),
         }
+    }
+
+    fn account_slot(&self, id: ObjectId) -> Arc<Semaphore> {
+        let mut slots = self
+            .account_slots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Arc::clone(
+            slots
+                .entry(id)
+                .or_insert_with(|| Arc::new(Semaphore::new(1))),
+        )
     }
 
     pub async fn dispatch(
         &self,
+        route_id: Option<ObjectId>,
         mail_from: &str,
         recipients: &[String],
         raw: &[u8],
@@ -59,23 +77,47 @@ impl Router {
         if recipients.is_empty() {
             return Err(AppError::Invalid("no recipients".into()));
         }
+        let allowed = match route_id {
+            Some(id) => {
+                let route = self.store.find_route_by_id(id).await?;
+                if !route.active {
+                    return Err(AppError::Invalid("route is disabled".into()));
+                }
+                if route.account_ids.is_empty() {
+                    return Err(AppError::NoCapacity);
+                }
+                Some(route.account_ids.into_iter().collect::<HashSet<ObjectId>>())
+            }
+            None => None,
+        };
         let _permit = self
             .permits
             .acquire()
             .await
             .map_err(|_| AppError::Internal("send semaphore closed".into()))?;
         let now = Utc::now();
-        let candidates = self.candidates(now).await?;
+        let candidates = self.candidates(now, allowed.as_ref()).await?;
         if candidates.is_empty() {
             return Err(AppError::NoCapacity);
         }
 
         let mut attempts = 0u32;
         let mut last_error = None;
+        let attempt_limit = if self.max_attempts == 0 {
+            usize::MAX
+        } else {
+            self.max_attempts
+        };
         for account in candidates {
-            if attempts as usize >= self.max_attempts {
+            if attempts as usize >= attempt_limit {
                 break;
             }
+            let slot = self.account_slot(account.id);
+            let Ok(_slot_guard) = slot.try_acquire_owned() else {
+                // The account is already sending for another app; take the
+                // next idle account instead of queueing behind it.
+                continue;
+            };
             let Some(reserved) = self.store.reserve(&account, now).await? else {
                 continue;
             };
@@ -167,12 +209,17 @@ impl Router {
         Err(last_error.unwrap_or(AppError::NoCapacity))
     }
 
-    async fn candidates(&self, now: DateTime<Utc>) -> Result<Vec<Account>> {
+    async fn candidates(
+        &self,
+        now: DateTime<Utc>,
+        allowed: Option<&HashSet<ObjectId>>,
+    ) -> Result<Vec<Account>> {
         let mut accounts: Vec<Account> = self
             .store
             .list_accounts(true)
             .await?
             .into_iter()
+            .filter(|account| allowed.is_none_or(|ids| ids.contains(&account.id)))
             .filter(|account| account.is_available(now))
             .filter(|account| account.effective_priority(now).is_some())
             .collect();

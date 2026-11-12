@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>smtpmaster admin</title>
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.45 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; justify-content: space-between;
+           padding: 14px 20px; border-bottom: 1px solid color-mix(in srgb, currentColor 18%, transparent); }
+  h1 { font-size: 18px; margin: 0; letter-spacing: .2px; }
+  main { padding: 20px; display: grid; gap: 24px; max-width: 1400px; margin: 0 auto; }
+  section { border: 1px solid color-mix(in srgb, currentColor 16%, transparent); border-radius: 10px; padding: 14px 16px; }
+  section h2 { margin: 0 0 10px; font-size: 15px; font-weight: 600; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  input, button { font: inherit; padding: 6px 9px; border-radius: 7px;
+                  border: 1px solid color-mix(in srgb, currentColor 25%, transparent); background: transparent; color: inherit; }
+  input[type=password] { min-width: 220px; }
+  button { cursor: pointer; }
+  button:hover { background: color-mix(in srgb, currentColor 10%, transparent); }
+  button.danger { border-color: #c0392b; color: #c0392b; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid color-mix(in srgb, currentColor 10%, transparent); vertical-align: middle; }
+  th { font-weight: 600; font-size: 12px; text-transform: uppercase; opacity: .7; white-space: nowrap; }
+  td.num { font-variant-numeric: tabular-nums; white-space: nowrap; }
+  td input[type=number] { width: 84px; padding: 3px 6px; }
+  .muted { opacity: .6; }
+  .ok { color: #1e8449; }
+  .bad { color: #c0392b; }
+  .pill { display: inline-block; padding: 1px 7px; border-radius: 999px; font-size: 12px;
+          border: 1px solid color-mix(in srgb, currentColor 25%, transparent); }
+  pre { margin: 0; white-space: pre-wrap; word-break: break-word; }
+  .stats { display: flex; flex-wrap: wrap; gap: 10px 26px; }
+  .stats div { min-width: 130px; }
+  .stats b { display: block; font-size: 20px; font-variant-numeric: tabular-nums; }
+  .scroll { overflow-x: auto; }
+</style>
+</head>
+<body>
+<header>
+  <h1>smtpmaster <span class="muted">admin</span></h1>
+  <div class="row">
+    <input id="token" type="password" placeholder="Admin token" autocomplete="off">
+    <button id="connect">Connect</button>
+    <span id="status" class="muted">not connected</span>
+  </div>
+</header>
+
+<main>
+  <section>
+    <h2>Stats</h2>
+    <div id="stats" class="stats"><span class="muted">connect to load</span></div>
+  </section>
+
+  <section>
+    <h2>Accounts</h2>
+    <div class="scroll"><table>
+      <thead><tr>
+        <th>Name</th><th>Status</th><th>Quota</th><th>Total</th><th>Rate/min</th>
+        <th>Priority</th><th>Count max</th><th>Total max</th><th>Actions</th>
+      </tr></thead>
+      <tbody id="accounts"><tr><td colspan="9" class="muted">—</td></tr></tbody>
+    </table></div>
+  </section>
+
+  <section>
+    <h2>Routes</h2>
+    <div class="scroll"><table>
+      <thead><tr><th>Name</th><th>Inbound user</th><th>Status</th><th>Outbound pool</th><th>Actions</th></tr></thead>
+      <tbody id="routes"><tr><td colspan="5" class="muted">—</td></tr></tbody>
+    </table></div>
+  </section>
+
+  <section>
+    <h2>Recent sends</h2>
+    <div class="scroll"><table>
+      <thead><tr><th>Time</th><th>Account</th><th>Status</th><th>Recipients</th><th>Error</th></tr></thead>
+      <tbody id="logs"><tr><td colspan="5" class="muted">—</td></tr></tbody>
+    </table></div>
+  </section>
+</main>
+
+<script>
+const tokenInput = document.getElementById('token');
+const statusEl = document.getElementById('status');
+let token = localStorage.getItem('smtpmaster_token') || '';
+let timer = null;
+
+function escapeHtml(value) {
+  return String(value ?? '').replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+function setStatus(text, bad) {
+  statusEl.textContent = text;
+  statusEl.className = bad ? 'bad' : 'ok';
+}
+async function api(path, options = {}) {
+  const headers = Object.assign({'Content-Type': 'application/json'}, options.headers || {});
+  if (token) headers.Authorization = 'Bearer ' + token;
+  const response = await fetch(path, Object.assign({}, options, {headers}));
+  if (!response.ok) {
+    let message = response.statusText;
+    try { message = (await response.json()).error || message; } catch (_) {}
+    throw new Error(message);
+  }
+  return response.json();
+}
+function statCard(label, value) {
+  return `<div><b>${escapeHtml(value)}</b><span class="muted">${escapeHtml(label)}</span></div>`;
+}
+function renderStats(s) {
+  document.getElementById('stats').innerHTML = [
+    statCard('accounts', s.total_accounts),
+    statCard('active', s.active_accounts),
+    statCard('expired', s.expired_accounts),
+    statCard('disabled', s.disabled_accounts),
+    statCard('capped used/capacity', `${s.used_current_window} / ${s.capacity_current_window}`),
+    statCard('unlimited accounts', s.unlimited_accounts),
+    statCard('sent 24h', s.sent_24h),
+    statCard('failed 24h', s.failed_24h),
+  ].join('');
+}
+function renderAccounts(accounts) {
+  const body = document.getElementById('accounts');
+  if (!accounts.length) { body.innerHTML = '<tr><td colspan="9" class="muted">no accounts</td></tr>'; return; }
+  body.innerHTML = accounts.map((a) => {
+    const active = a.active ? '<span class="pill ok">active</span>' : '<span class="pill bad">off</span>';
+    const quota = a.count_max > 0 ? `${a.count_used}/${a.count_max}` : `${a.count_used}/∞`;
+    const total = a.total_max > 0 ? `${a.total_sent}/${a.total_max}` : `${a.total_sent}/∞`;
+    const action = a.active ? 'disable' : 'enable';
+    return `<tr>
+      <td>${escapeHtml(a.name)}</td>
+      <td>${active}</td>
+      <td class="num">${escapeHtml(quota)}</td>
+      <td class="num">${escapeHtml(total)}</td>
+      <td class="num">${escapeHtml(a.rate_limit_per_min || '∞')}</td>
+      <td class="num">${escapeHtml(a.priority)}</td>
+      <td><input type="number" min="0" step="1" value="${escapeHtml(a.count_max)}" data-field="count_max" data-account="${escapeHtml(a.name)}"></td>
+      <td><input type="number" min="0" step="1" value="${escapeHtml(a.total_max)}" data-field="total_max" data-account="${escapeHtml(a.name)}"></td>
+      <td class="row">
+        <button data-action="${action}" data-account="${escapeHtml(a.name)}">${action}</button>
+        <button data-action="save" data-account="${escapeHtml(a.name)}">save</button>
+        <button data-action="reset" data-account="${escapeHtml(a.name)}">reset</button>
+      </td>
+    </tr>`;
+  }).join('');
+}
+function renderRoutes(routes) {
+  const body = document.getElementById('routes');
+  if (!routes.length) { body.innerHTML = '<tr><td colspan="5" class="muted">no routes (legacy global pool)</td></tr>'; return; }
+  body.innerHTML = routes.map((r) => {
+    const active = r.active ? '<span class="pill ok">active</span>' : '<span class="pill bad">off</span>';
+    const pool = (r.accounts || []).map((a) => a.name || ('missing:' + a.id)).join(', ') || '—';
+    const action = r.active ? 'disable' : 'enable';
+    return `<tr>
+      <td>${escapeHtml(r.name)}</td>
+      <td>${escapeHtml(r.username)}</td>
+      <td>${active}</td>
+      <td>${escapeHtml(pool)}</td>
+      <td><button data-action="${action}" data-route="${escapeHtml(r.name)}">${action}</button></td>
+    </tr>`;
+  }).join('');
+}
+function renderLogs(logs) {
+  const body = document.getElementById('logs');
+  if (!logs.length) { body.innerHTML = '<tr><td colspan="5" class="muted">no sends yet</td></tr>'; return; }
+  body.innerHTML = logs.map((l) => `<tr>
+    <td class="num">${escapeHtml(new Date(l.ts).toLocaleString())}</td>
+    <td>${escapeHtml(l.account)}</td>
+    <td class="${l.status === 'sent' ? 'ok' : 'bad'}">${escapeHtml(l.status)}</td>
+    <td>${escapeHtml((l.recipients || []).join(', '))}</td>
+    <td class="muted">${escapeHtml(l.error || '')}</td>
+  </tr>`).join('');
+}
+async function refresh() {
+  if (!token) return;
+  try {
+    const [stats, accounts, routes, logs] = await Promise.all([
+      api('/api/stats'), api('/api/accounts'), api('/api/routes'), api('/api/send_log?limit=50'),
+    ]);
+    renderStats(stats);
+    renderAccounts(accounts.accounts || []);
+    renderRoutes(routes.routes || []);
+    renderLogs(logs.logs || []);
+    setStatus('connected · ' + new Date().toLocaleTimeString(), false);
+  } catch (error) {
+    setStatus(error.message, true);
+  }
+}
+async function accountAction(action, name) {
+  try {
+    if (action === 'enable' || action === 'disable' || action === 'reset') {
+      await api(`/api/accounts/${encodeURIComponent(name)}/${action}`, {method: 'POST'});
+    } else if (action === 'save') {
+      const body = {};
+      document.querySelectorAll(`input[data-account="${CSS.escape(name)}"]`).forEach((input) => {
+        body[input.dataset.field] = Number(input.value);
+      });
+      await api(`/api/accounts/${encodeURIComponent(name)}`, {method: 'PATCH', body: JSON.stringify(body)});
+    }
+    await refresh();
+  } catch (error) { setStatus(error.message, true); }
+}
+document.addEventListener('click', (event) => {
+  const button = event.target.closest('button');
+  if (!button) return;
+  if (button.dataset.account) accountAction(button.dataset.action, button.dataset.account);
+  if (button.dataset.route) {
+    api(`/api/routes/${encodeURIComponent(button.dataset.route)}/${button.dataset.action}`, {method: 'POST'})
+      .then(refresh).catch((error) => setStatus(error.message, true));
+  }
+});
+document.getElementById('connect').addEventListener('click', () => {
+  token = tokenInput.value.trim();
+  localStorage.setItem('smtpmaster_token', token);
+  refresh();
+  if (timer) clearInterval(timer);
+  timer = setInterval(refresh, 5000);
+});
+tokenInput.value = token;
+if (token) { refresh(); timer = setInterval(refresh, 5000); }
+</script>
+</body>
+</html>

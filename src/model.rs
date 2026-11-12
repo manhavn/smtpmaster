@@ -89,6 +89,53 @@ impl fmt::Display for TlsMode {
     }
 }
 
+/// Runtime-toggled settings for the optional admin dashboard.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminSettings {
+    #[serde(rename = "_id")]
+    pub id: String,
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_admin_listen")]
+    pub listen: String,
+    #[serde(default)]
+    pub token: String,
+    #[serde(default = "epoch", with = "crate::serde_bson::datetime")]
+    pub updated_at: DateTime<Utc>,
+}
+
+fn default_admin_listen() -> String {
+    AdminSettings::DEFAULT_LISTEN.to_string()
+}
+
+fn epoch() -> DateTime<Utc> {
+    DateTime::<Utc>::UNIX_EPOCH
+}
+
+impl AdminSettings {
+    pub const DEFAULT_LISTEN: &'static str = "127.0.0.1:8787";
+    pub const ID: &'static str = "dashboard";
+
+    pub fn defaults() -> Self {
+        Self {
+            id: Self::ID.to_string(),
+            enabled: false,
+            listen: Self::DEFAULT_LISTEN.to_string(),
+            token: String::new(),
+            updated_at: DateTime::<Utc>::UNIX_EPOCH,
+        }
+    }
+
+    pub fn token_masked(&self) -> String {
+        if self.token.is_empty() {
+            "-".to_string()
+        } else {
+            let prefix: String = self.token.chars().take(4).collect();
+            format!("{prefix}…")
+        }
+    }
+}
+
 /// One SMTP account plus its quota, rate-limit and scheduling state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Account {

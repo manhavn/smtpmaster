@@ -17,8 +17,8 @@ mode = "priority"
 # Maximum concurrent upstream sends. Ignored when sequential = true.
 concurrency = 8
 sequential = false
-# Try this many accounts before giving up on a message.
-max_attempts = 3
+# Accounts to try per message; 0 = try every eligible account.
+max_attempts = 0
 # Disable an account after N consecutive failures (0 disables the feature).
 fail_threshold = 5
 send_timeout_secs = 60

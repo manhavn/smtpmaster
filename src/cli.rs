@@ -1,7 +1,8 @@
 //! Command line interface.
 
+use std::collections::HashMap;
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -17,6 +18,7 @@ use crate::error::{AppError, Result};
 use crate::maintenance;
 use crate::model::{Account, Provider, TlsMode, parse_reset_at, validate_timezone};
 use crate::render;
+use crate::route::Route;
 use crate::router::Router;
 use crate::schedule::{Schedule, parse_window};
 use crate::service;
@@ -57,12 +59,22 @@ enum Command {
         #[command(subcommand)]
         command: AccountCommand,
     },
+    /// Manage inbound identities and their outbound account pools.
+    Route {
+        #[command(subcommand)]
+        command: RouteCommand,
+    },
     /// Run the SMTP relay that distributes mail across accounts.
     Serve(ServeArgs),
     /// Reset quota windows and disable expired accounts.
     Maintenance(MaintenanceArgs),
     /// Show routing statistics.
     Stats,
+    /// Enable/disable the token-protected web dashboard at runtime.
+    Admin {
+        #[command(subcommand)]
+        command: AdminCommand,
+    },
     /// Generate and install a systemd unit for auto-start.
     #[command(visible_alias = "autostart")]
     Service {
@@ -233,6 +245,97 @@ struct UpdateArgs {
     disable: bool,
 }
 
+#[derive(Debug, Subcommand)]
+enum RouteCommand {
+    /// Add an inbound route with its own outbound account pool.
+    Add(RouteAddArgs),
+    /// List routes.
+    List,
+    /// Show one route.
+    Show { route: String },
+    /// Change a route.
+    Update(RouteUpdateArgs),
+    /// Delete a route permanently.
+    Delete {
+        route: String,
+        /// Confirm the deletion.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Enable a route.
+    Enable { route: String },
+    /// Disable a route.
+    Disable { route: String },
+}
+
+#[derive(Debug, Args)]
+struct RouteAddArgs {
+    /// Unique route name.
+    #[arg(long)]
+    name: String,
+    /// Inbound SMTP AUTH username used by the external app.
+    #[arg(long)]
+    username: String,
+    #[arg(long)]
+    password: Option<String>,
+    #[arg(long)]
+    password_stdin: bool,
+    #[arg(long, value_name = "VAR")]
+    password_env: Option<String>,
+    /// Outbound account (name or id), repeatable; at least one.
+    #[arg(long = "account", value_name = "ACCOUNT", required = true)]
+    accounts: Vec<String>,
+    #[arg(long)]
+    description: Option<String>,
+    /// Create the route disabled.
+    #[arg(long)]
+    inactive: bool,
+}
+
+#[derive(Debug, Args)]
+struct RouteUpdateArgs {
+    route: String,
+    #[arg(long)]
+    rename: Option<String>,
+    #[arg(long)]
+    username: Option<String>,
+    #[arg(long)]
+    password: Option<String>,
+    #[arg(long)]
+    password_stdin: bool,
+    #[arg(long, value_name = "VAR")]
+    password_env: Option<String>,
+    /// Replace the outbound account pool (repeatable).
+    #[arg(long = "account", value_name = "ACCOUNT")]
+    accounts: Vec<String>,
+    /// Remove every outbound account from the pool.
+    #[arg(long, conflicts_with = "accounts")]
+    clear_accounts: bool,
+    #[arg(long)]
+    description: Option<String>,
+    #[arg(long, conflicts_with = "disable")]
+    enable: bool,
+    #[arg(long, conflicts_with = "enable")]
+    disable: bool,
+}
+
+#[derive(Debug, Subcommand)]
+enum AdminCommand {
+    /// Enable the web dashboard (applies without restarting serve).
+    Enable {
+        /// Dashboard token (at least 16 characters). Reused when omitted.
+        #[arg(long, value_name = "TOKEN")]
+        token: Option<String>,
+        /// Listen address, e.g. 127.0.0.1:8787.
+        #[arg(long, value_name = "ADDR")]
+        listen: Option<String>,
+    },
+    /// Disable the web dashboard.
+    Disable,
+    /// Show the dashboard settings.
+    Status,
+}
+
 #[derive(Debug, Args)]
 struct ServeArgs {
     #[arg(long)]
@@ -252,6 +355,15 @@ struct ServeArgs {
     max_message_size: Option<usize>,
     #[arg(long)]
     max_connections: Option<usize>,
+    /// Detach and keep running in the background.
+    #[arg(long)]
+    daemon: bool,
+    /// PID file used by --daemon (default: state directory).
+    #[arg(long, value_name = "PATH")]
+    pid_file: Option<PathBuf>,
+    /// Log file used by --daemon (default: state directory).
+    #[arg(long, value_name = "PATH")]
+    log_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -322,6 +434,8 @@ pub async fn run() -> Result<()> {
             Ok(())
         }
         Command::Account { command } => handle_account(&config, command, cli.json).await,
+        Command::Route { command } => handle_route(&config, command, cli.json).await,
+        Command::Admin { command } => handle_admin(&config, command, cli.json).await,
         Command::Serve(args) => serve(config, args).await,
         Command::Maintenance(args) => {
             let store = Arc::new(connect(&config).await?);
@@ -772,6 +886,9 @@ async fn handle_account(config: &Config, command: AccountCommand, json: bool) ->
 }
 
 async fn serve(config: Config, args: ServeArgs) -> Result<()> {
+    if args.daemon && std::env::var("SMTPMASTER_DAEMONIZED").as_deref() != Ok("1") {
+        return daemonize(&args);
+    }
     let mut server: ServerConfig = config.server.clone();
     if let Some(listen) = args.listen {
         server.listen = listen;
@@ -797,14 +914,13 @@ async fn serve(config: Config, args: ServeArgs) -> Result<()> {
     if let Some(connections) = args.max_connections {
         server.max_connections = connections;
     }
-    if server.auth_required && server.users.is_empty() {
-        return Err(AppError::Config(
-            "authentication is required but no users are configured (see [[server.users]])".into(),
-        ));
-    }
-
     let store = Arc::new(connect(&config).await?);
     store.ensure_indexes().await?;
+    if server.auth_required && server.users.is_empty() && !store.routes_active().await? {
+        return Err(AppError::Config(
+            "authentication is required but neither routes nor server.users are configured".into(),
+        ));
+    }
     let router = Arc::new(Router::new(Arc::clone(&store), &server));
     let listener = TcpListener::bind(&server.listen).await?;
     let address = listener.local_addr()?;
@@ -817,8 +933,13 @@ async fn serve(config: Config, args: ServeArgs) -> Result<()> {
 
     let interval = Duration::from_secs(config.maintenance.interval_secs.max(1));
     tokio::spawn(maintenance::watch(Arc::clone(&store), interval));
+    // Toggled from the CLI through MongoDB; never restarts the SMTP side.
+    tokio::spawn(crate::admin::watch(
+        Arc::clone(&store),
+        Duration::from_secs(2),
+    ));
     tokio::select! {
-        result = crate::smtp::server::serve(listener, router, server) => result,
+        result = crate::smtp::server::serve(listener, router, Arc::clone(&store), server) => result,
         _ = tokio::signal::ctrl_c() => {
             tracing::info!("shutdown signal received");
             Ok(())
@@ -833,6 +954,363 @@ async fn connect(config: &Config) -> Result<Store> {
         config.log.retention_days,
     )
     .await
+}
+
+async fn handle_admin(config: &Config, command: AdminCommand, json: bool) -> Result<()> {
+    let store = connect(config).await?;
+    match command {
+        AdminCommand::Enable { token, listen } => {
+            let mut settings = store.admin_settings().await?;
+            if let Some(token) = token {
+                let token = token.trim().to_string();
+                if token.len() < 16 {
+                    return Err(AppError::Invalid(
+                        "the dashboard token must be at least 16 characters".into(),
+                    ));
+                }
+                settings.token = token;
+            }
+            if settings.token.is_empty() {
+                return Err(AppError::Invalid(
+                    "provide --token (or enable the dashboard once with a token)".into(),
+                ));
+            }
+            if let Some(listen) = listen {
+                let address: std::net::SocketAddr = listen.parse().map_err(|_| {
+                    AppError::Invalid(format!(
+                        "`{listen}` is not a valid listen address (e.g. 127.0.0.1:8787)"
+                    ))
+                })?;
+                if !address.ip().is_loopback() {
+                    eprintln!(
+                        "warning: the dashboard will be reachable from the network on {address}; keep the token secret"
+                    );
+                }
+                settings.listen = listen;
+            }
+            settings.enabled = true;
+            settings.updated_at = Utc::now();
+            store.save_admin_settings(&settings).await?;
+            if json {
+                print_json(&serde_json::json!({
+                    "enabled": true,
+                    "listen": settings.listen,
+                    "token": settings.token_masked(),
+                }))
+            } else {
+                println!(
+                    "admin dashboard enabled at http://{} (token {})",
+                    settings.listen,
+                    settings.token_masked()
+                );
+                println!("the running `serve` process picks this up within a few seconds");
+                Ok(())
+            }
+        }
+        AdminCommand::Disable => {
+            let mut settings = store.admin_settings().await?;
+            settings.enabled = false;
+            settings.updated_at = Utc::now();
+            store.save_admin_settings(&settings).await?;
+            if json {
+                print_json(&serde_json::json!({
+                    "enabled": false,
+                    "listen": settings.listen,
+                    "token": settings.token_masked(),
+                }))
+            } else {
+                println!("admin dashboard disabled");
+                Ok(())
+            }
+        }
+        AdminCommand::Status => {
+            let settings = store.admin_settings().await?;
+            if json {
+                print_json(&serde_json::json!({
+                    "enabled": settings.enabled,
+                    "listen": settings.listen,
+                    "token": settings.token_masked(),
+                    "updated_at": settings.updated_at.to_rfc3339_opts(SecondsFormat::Secs, true),
+                }))
+            } else {
+                println!("enabled   {}", settings.enabled);
+                println!("listen    {}", settings.listen);
+                println!("token     {}", settings.token_masked());
+                println!(
+                    "updated   {}",
+                    settings
+                        .updated_at
+                        .to_rfc3339_opts(SecondsFormat::Secs, true)
+                );
+                Ok(())
+            }
+        }
+    }
+}
+
+async fn handle_route(config: &Config, command: RouteCommand, json: bool) -> Result<()> {
+    let store = connect(config).await?;
+    match command {
+        RouteCommand::Add(args) => {
+            store.ensure_indexes().await?;
+            let password =
+                resolve_password(&args.password, args.password_stdin, &args.password_env)?
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| {
+                        AppError::Invalid(
+                            "provide --password, --password-stdin or --password-env".into(),
+                        )
+                    })?;
+            if args.username.trim().is_empty() {
+                return Err(AppError::Invalid("--username must not be empty".into()));
+            }
+            let account_ids = resolve_account_ids(&store, &args.accounts).await?;
+            if account_ids.is_empty() {
+                return Err(AppError::Invalid(
+                    "a route needs at least one account".into(),
+                ));
+            }
+            let now = Utc::now();
+            let mut route = Route::new(args.name, args.username, password, account_ids, now);
+            route.description = args.description.filter(|value| !value.trim().is_empty());
+            if args.inactive {
+                route.active = false;
+            }
+            store.insert_route(&route).await?;
+            if json {
+                print_json(&route.redacted())
+            } else {
+                println!(
+                    "route `{}` created for inbound user `{}` with {} account(s)",
+                    route.name,
+                    route.username,
+                    route.account_ids.len()
+                );
+                Ok(())
+            }
+        }
+        RouteCommand::List => {
+            let routes = store.list_routes().await?;
+            if json {
+                let redacted: Vec<Route> = routes.iter().map(Route::redacted).collect();
+                return print_json(&redacted);
+            }
+            if routes.is_empty() {
+                println!("no routes");
+                return Ok(());
+            }
+            let names = account_names(&store).await?;
+            let headers = vec![
+                "NAME",
+                "USERNAME",
+                "STATUS",
+                "ACCOUNTS",
+                "DESCRIPTION",
+                "UPDATED",
+            ];
+            let rows: Vec<Vec<String>> = routes
+                .iter()
+                .map(|route| {
+                    vec![
+                        route.name.clone(),
+                        route.username.clone(),
+                        route.status_label().to_string(),
+                        route_accounts_label(route, &names),
+                        truncate_text(route.description.clone().unwrap_or_default(), 30),
+                        route.updated_at.format("%Y-%m-%d %H:%M").to_string(),
+                    ]
+                })
+                .collect();
+            render::table(&headers, &rows);
+            Ok(())
+        }
+        RouteCommand::Show { route } => {
+            let route = store.find_route(&route).await?;
+            if json {
+                return print_json(&route.redacted());
+            }
+            let names = account_names(&store).await?;
+            let accounts = if route.account_ids.is_empty() {
+                "-".to_string()
+            } else {
+                route
+                    .account_ids
+                    .iter()
+                    .map(|id| {
+                        names
+                            .get(id)
+                            .cloned()
+                            .unwrap_or_else(|| format!("missing:{}", id.to_hex()))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            for (key, value) in [
+                kv("name", route.name.clone()),
+                kv("id", route.id.to_hex()),
+                kv("username", route.username.clone()),
+                kv("password", "***".to_string()),
+                kv("status", route.status_label().to_string()),
+                kv("description", route.description.clone().unwrap_or_default()),
+                kv("accounts", accounts),
+                kv(
+                    "created",
+                    route.created_at.to_rfc3339_opts(SecondsFormat::Secs, true),
+                ),
+                kv(
+                    "updated",
+                    route.updated_at.to_rfc3339_opts(SecondsFormat::Secs, true),
+                ),
+            ] {
+                println!("{key:<14}{value}");
+            }
+            Ok(())
+        }
+        RouteCommand::Update(args) => {
+            let route = store.find_route(&args.route).await?;
+            let now = Utc::now();
+            let mut set = Document::new();
+            let mut unset = Document::new();
+            if let Some(rename) = args.rename {
+                if rename.trim().is_empty() {
+                    return Err(AppError::Invalid("--rename must not be empty".into()));
+                }
+                set.insert("name", rename);
+            }
+            if let Some(username) = args.username {
+                if username.trim().is_empty() {
+                    return Err(AppError::Invalid("--username must not be empty".into()));
+                }
+                set.insert("username", username);
+            }
+            if let Some(password) =
+                resolve_password(&args.password, args.password_stdin, &args.password_env)?
+            {
+                if password.is_empty() {
+                    return Err(AppError::Invalid("password must not be empty".into()));
+                }
+                set.insert("password", password);
+            }
+            if let Some(description) = args.description {
+                if description.trim().is_empty() {
+                    unset.insert("description", "");
+                } else {
+                    set.insert("description", description);
+                }
+            }
+            if args.clear_accounts {
+                set.insert("account_ids", Vec::<ObjectId>::new());
+            } else if !args.accounts.is_empty() {
+                let ids = resolve_account_ids(&store, &args.accounts).await?;
+                if ids.is_empty() {
+                    return Err(AppError::Invalid(
+                        "a route needs at least one account".into(),
+                    ));
+                }
+                set.insert("account_ids", ids);
+            }
+            if args.enable {
+                set.insert("active", true);
+            }
+            if args.disable {
+                set.insert("active", false);
+            }
+            if set.is_empty() && unset.is_empty() {
+                return Err(AppError::Invalid("nothing to update".into()));
+            }
+            set.insert("updated_at", bdate(now));
+            let mut update = Document::new();
+            update.insert("$set", set);
+            if !unset.is_empty() {
+                update.insert("$unset", unset);
+            }
+            let updated = store.update_route(route.id, update).await?;
+            if json {
+                print_json(&updated.redacted())
+            } else {
+                println!("route `{}` updated", updated.name);
+                Ok(())
+            }
+        }
+        RouteCommand::Delete { route, yes } => {
+            if !yes {
+                return Err(AppError::Invalid("refusing to delete without --yes".into()));
+            }
+            let route = store.find_route(&route).await?;
+            store.delete_route(route.id).await?;
+            println!("route `{}` deleted", route.name);
+            Ok(())
+        }
+        RouteCommand::Enable { route } => {
+            let route = store.find_route(&route).await?;
+            let updated = store.set_route_active(route.id, true).await?;
+            if json {
+                print_json(&updated.redacted())
+            } else {
+                println!("route `{}` enabled", updated.name);
+                Ok(())
+            }
+        }
+        RouteCommand::Disable { route } => {
+            let route = store.find_route(&route).await?;
+            let updated = store.set_route_active(route.id, false).await?;
+            if json {
+                print_json(&updated.redacted())
+            } else {
+                println!("route `{}` disabled", updated.name);
+                Ok(())
+            }
+        }
+    }
+}
+
+async fn resolve_account_ids(store: &Store, selectors: &[String]) -> Result<Vec<ObjectId>> {
+    let mut ids = Vec::new();
+    for selector in selectors {
+        let account = store.find_account(selector).await?;
+        if !ids.contains(&account.id) {
+            ids.push(account.id);
+        }
+    }
+    Ok(ids)
+}
+
+async fn account_names(store: &Store) -> Result<HashMap<ObjectId, String>> {
+    Ok(store
+        .list_accounts(false)
+        .await?
+        .into_iter()
+        .map(|account| (account.id, account.name))
+        .collect())
+}
+
+fn route_accounts_label(route: &Route, names: &HashMap<ObjectId, String>) -> String {
+    if route.account_ids.is_empty() {
+        return "-".to_string();
+    }
+    truncate_text(
+        route
+            .account_ids
+            .iter()
+            .map(|id| {
+                names
+                    .get(id)
+                    .cloned()
+                    .unwrap_or_else(|| format!("missing:{}", id.to_hex()))
+            })
+            .collect::<Vec<_>>()
+            .join(","),
+        40,
+    )
+}
+
+fn truncate_text(input: String, max: usize) -> String {
+    if input.chars().count() <= max {
+        return input;
+    }
+    let mut out: String = input.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
 }
 
 fn handle_service(config_path: Option<&std::path::Path>, command: ServiceCommand) -> Result<()> {
@@ -892,6 +1370,90 @@ fn build_unit_options(
         environment,
         service_scope(options),
     )
+}
+
+fn daemonize(args: &ServeArgs) -> Result<()> {
+    let state_dir = default_state_dir();
+    std::fs::create_dir_all(&state_dir)?;
+    let log_path = args
+        .log_file
+        .clone()
+        .unwrap_or_else(|| state_dir.join("smtpmaster.log"));
+    let pid_path = args
+        .pid_file
+        .clone()
+        .unwrap_or_else(|| state_dir.join("smtpmaster.pid"));
+    if let Some(parent) = log_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    if let Some(parent) = pid_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    if let Some(existing) = read_pid(&pid_path) {
+        if process_alive(existing) {
+            return Err(AppError::Conflict(format!(
+                "smtpmaster is already running with pid {existing} (pid file {})",
+                pid_path.display()
+            )));
+        }
+    }
+
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)?;
+    let executable = std::env::current_exe()?;
+    let mut command = std::process::Command::new(executable);
+    command.args(std::env::args_os().skip(1));
+    command.env("SMTPMASTER_DAEMONIZED", "1");
+    command.stdin(std::process::Stdio::null());
+    command.stdout(std::process::Stdio::null());
+    command.stderr(std::process::Stdio::from(log));
+    // Detach from the controlling terminal and become a session leader.
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|error| AppError::Internal(format!("cannot start daemon: {error}")))?;
+    let pid = child.id();
+    std::fs::write(&pid_path, format!("{pid}\n"))?;
+    std::thread::sleep(Duration::from_millis(400));
+    if let Some(status) = child.try_wait()? {
+        let _ = std::fs::remove_file(&pid_path);
+        return Err(AppError::Internal(format!(
+            "daemon exited during startup ({status}); see {}",
+            log_path.display()
+        )));
+    }
+    println!("smtpmaster running in background (pid {pid})");
+    println!("log: {}", log_path.display());
+    println!("pid file: {}", pid_path.display());
+    Ok(())
+}
+
+fn default_state_dir() -> PathBuf {
+    if let Some(directory) = std::env::var_os("XDG_STATE_HOME").filter(|value| !value.is_empty()) {
+        return PathBuf::from(directory).join("smtpmaster");
+    }
+    if let Some(home) = std::env::var_os("HOME").filter(|value| !value.is_empty()) {
+        return PathBuf::from(home).join(".local/state/smtpmaster");
+    }
+    PathBuf::from("/tmp/smtpmaster")
+}
+
+fn read_pid(path: &Path) -> Option<u32> {
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+fn process_alive(pid: u32) -> bool {
+    Path::new("/proc").join(pid.to_string()).exists()
 }
 
 fn init_tracing(verbose: u8) {

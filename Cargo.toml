@@ -14,11 +14,13 @@ name = "smtpmaster"
 path = "src/main.rs"
 
 [dependencies]
+axum = "0.8"
 base64 = "0.23"
 bson = { version = "3.1", features = ["chrono-0_4"] }
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
 clap = { version = "4.6", features = ["derive"] }
+libc = "0.2"
 mongodb = { version = "3.10", default-features = false, features = ["compat-3-3-0", "bson-3", "rustls-tls", "dns-resolver"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 serde = { version = "1", features = ["derive"] }
@@ -38,6 +40,11 @@ toml = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 webpki-roots = "1"
+
+[dev-dependencies]
+bytes = "1"
+http-body-util = "0.1"
+tower = { version = "0.5", features = ["util"] }
 
 [profile.release]
 lto = "thin"

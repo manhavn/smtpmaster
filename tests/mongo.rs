@@ -6,6 +6,7 @@ use bson::{Bson, doc, oid::ObjectId};
 use chrono::{TimeDelta, Utc};
 use smtpmaster::error::AppError;
 use smtpmaster::model::{Account, Provider, TlsMode};
+use smtpmaster::route::Route;
 use smtpmaster::store::Store;
 
 fn test_uri() -> Option<String> {
@@ -260,6 +261,79 @@ async fn crud_and_unique_names() {
     store.delete_account(original.id).await.unwrap();
     assert!(matches!(
         store.find_account("crud").await,
+        Err(AppError::NotFound(_))
+    ));
+
+    cleanup(&store).await;
+}
+
+#[tokio::test]
+async fn route_persistence_and_authentication() {
+    let Some(store) = test_store().await else {
+        eprintln!("skipping: SMTPMASTER_TEST_MONGO_URI not set");
+        return;
+    };
+    let first = account("route-a");
+    let second = account("route-b");
+    store.insert_account(&first).await.unwrap();
+    store.insert_account(&second).await.unwrap();
+
+    let now = Utc::now();
+    let route = Route::new("app", "inbound", "secret", vec![first.id, second.id], now);
+    store.insert_route(&route).await.unwrap();
+    assert!(store.routes_active().await.unwrap());
+
+    let found = store.find_route("app").await.unwrap();
+    assert_eq!(found.account_ids, vec![first.id, second.id]);
+    assert!(
+        store
+            .authenticate_route("inbound", "secret")
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        store
+            .authenticate_route("inbound", "wrong")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .authenticate_route("nobody", "secret")
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let duplicate = Route::new("other", "inbound", "x", Vec::new(), now);
+    match store.insert_route(&duplicate).await {
+        Err(AppError::Conflict(message)) => assert!(message.contains("route")),
+        other => panic!("expected conflict, got {other:?}"),
+    }
+
+    store.set_route_active(route.id, false).await.unwrap();
+    assert!(
+        store
+            .authenticate_route("inbound", "secret")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    store.set_route_active(route.id, true).await.unwrap();
+
+    let account_ids = bson::serialize_to_bson(&vec![second.id]).unwrap();
+    let updated = store
+        .update_route(route.id, doc! { "$set": { "account_ids": account_ids } })
+        .await
+        .unwrap();
+    assert_eq!(updated.account_ids, vec![second.id]);
+
+    store.delete_route(route.id).await.unwrap();
+    assert!(!store.routes_active().await.unwrap());
+    assert!(matches!(
+        store.find_route("app").await,
         Err(AppError::NotFound(_))
     ));
 

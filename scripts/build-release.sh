@@ -308,9 +308,10 @@ for index in "${!BUILT_ARCHES[@]}"; do
     name="smtpmaster-${VERSION}-linux-musl-${arch}"
     mkdir -p "$STAGE/$name"
     cp "$bin" "$STAGE/$name/smtpmaster"
-    cp README.md LICENSE config.example.toml "$STAGE/$name/"
+    cp README.md README.vi LICENSE config.example.toml "$STAGE/$name/"
     chmod +x "$STAGE/$name/smtpmaster"
-    tar -czf "$OUTPUT_DIR/$name.tar.gz" -C "$STAGE/$name" smtpmaster README.md LICENSE config.example.toml
+    tar -czf "$OUTPUT_DIR/$name.tar.gz" -C "$STAGE/$name" \
+        smtpmaster README.md README.vi LICENSE config.example.toml
     info "wrote outputs/$name.tar.gz"
 done
 
@@ -363,6 +364,13 @@ cat > "$OUTPUT_DIR/release-notes.md" <<EOF
 # smtpmaster v$VERSION
 
 Static musl builds for Linux amd64 and arm64.
+
+## Install
+
+\`\`\`sh
+mise use -g github:manhavn/smtpmaster
+smtpmaster --version
+\`\`\`
 
 ## Artifacts
 

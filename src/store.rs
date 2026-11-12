@@ -13,7 +13,8 @@ use serde::{Deserialize, Serialize};
 use tracing::debug;
 
 use crate::error::{AppError, Result};
-use crate::model::Account;
+use crate::model::{Account, AdminSettings};
+use crate::route::Route;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SendLog {
@@ -88,6 +89,14 @@ impl Store {
         self.db.collection::<SendLog>("send_log")
     }
 
+    fn routes(&self) -> Collection<Route> {
+        self.db.collection::<Route>("routes")
+    }
+
+    fn admin_settings_collection(&self) -> Collection<AdminSettings> {
+        self.db.collection::<AdminSettings>("admin_settings")
+    }
+
     pub async fn ensure_indexes(&self) -> Result<()> {
         self.accounts()
             .create_index(
@@ -115,6 +124,32 @@ impl Store {
                 mongodb::IndexModel::builder()
                     .keys(doc! { "expires_at": 1 })
                     .options(IndexOptions::builder().name("expiry".to_string()).build())
+                    .build(),
+            )
+            .await?;
+        self.routes()
+            .create_index(
+                mongodb::IndexModel::builder()
+                    .keys(doc! { "name": 1 })
+                    .options(
+                        IndexOptions::builder()
+                            .unique(true)
+                            .name("uniq_route_name".to_string())
+                            .build(),
+                    )
+                    .build(),
+            )
+            .await?;
+        self.routes()
+            .create_index(
+                mongodb::IndexModel::builder()
+                    .keys(doc! { "username": 1 })
+                    .options(
+                        IndexOptions::builder()
+                            .unique(true)
+                            .name("uniq_route_username".to_string())
+                            .build(),
+                    )
                     .build(),
             )
             .await?;
@@ -483,6 +518,42 @@ impl Store {
         Ok(report)
     }
 
+    pub async fn admin_settings(&self) -> Result<AdminSettings> {
+        Ok(self
+            .admin_settings_collection()
+            .find_one(doc! { "_id": AdminSettings::ID })
+            .await?
+            .unwrap_or_else(AdminSettings::defaults))
+    }
+
+    pub async fn save_admin_settings(&self, settings: &AdminSettings) -> Result<()> {
+        let update = doc! { "$set": {
+            "enabled": settings.enabled,
+            "listen": settings.listen.clone(),
+            "token": settings.token.clone(),
+            "updated_at": date(settings.updated_at),
+        } };
+        self.admin_settings_collection()
+            .update_one(doc! { "_id": AdminSettings::ID }, update)
+            .upsert(true)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn recent_send_log(&self, limit: i64) -> Result<Vec<SendLog>> {
+        let mut cursor = self
+            .logs()
+            .find(doc! {})
+            .sort(doc! { "ts": -1 })
+            .limit(limit.clamp(1, 500))
+            .await?;
+        let mut out = Vec::new();
+        while cursor.advance().await? {
+            out.push(cursor.deserialize_current()?);
+        }
+        Ok(out)
+    }
+
     pub async fn stats(&self, now: DateTime<Utc>) -> Result<Stats> {
         let accounts = self.list_accounts(false).await?;
         let mut stats = Stats {
@@ -516,6 +587,98 @@ impl Store {
             .count_documents(doc! { "ts": { "$gte": date(since) }, "status": "failed" })
             .await?;
         Ok(stats)
+    }
+}
+
+impl Store {
+    pub async fn insert_route(&self, route: &Route) -> Result<()> {
+        match self.routes().insert_one(route).await {
+            Ok(_) => Ok(()),
+            Err(e) => Err(map_write_error(e, "route", &route.name)),
+        }
+    }
+
+    pub async fn list_routes(&self) -> Result<Vec<Route>> {
+        let mut cursor = self.routes().find(doc! {}).sort(doc! { "name": 1 }).await?;
+        let mut out = Vec::new();
+        while cursor.advance().await? {
+            out.push(cursor.deserialize_current()?);
+        }
+        Ok(out)
+    }
+
+    pub async fn find_route(&self, key: &str) -> Result<Route> {
+        let key = key.trim();
+        if key.is_empty() {
+            return Err(AppError::Invalid("route name is empty".into()));
+        }
+        let filter = match ObjectId::parse_str(key) {
+            Ok(id) => doc! { "$or": [ { "_id": id }, { "name": key } ] },
+            Err(_) => doc! { "name": key },
+        };
+        self.routes()
+            .find_one(filter)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("route `{key}`")))
+    }
+
+    pub async fn find_route_by_id(&self, id: ObjectId) -> Result<Route> {
+        self.routes()
+            .find_one(doc! { "_id": id })
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("route {id}")))
+    }
+
+    /// Verify inbound credentials. Returns the route only when it is active.
+    pub async fn authenticate_route(
+        &self,
+        username: &str,
+        password: &str,
+    ) -> Result<Option<Route>> {
+        Ok(self
+            .routes()
+            .find_one(doc! {
+                "username": username,
+                "password": password,
+                "active": true,
+            })
+            .await?)
+    }
+
+    pub async fn routes_active(&self) -> Result<bool> {
+        Ok(self.routes().count_documents(doc! {}).await? > 0)
+    }
+
+    pub async fn update_route(&self, id: ObjectId, update: Document) -> Result<Route> {
+        if update.is_empty() {
+            return Err(AppError::Invalid("nothing to update".into()));
+        }
+        match self
+            .routes()
+            .find_one_and_update(doc! { "_id": id }, update)
+            .return_document(ReturnDocument::After)
+            .await
+        {
+            Ok(Some(route)) => Ok(route),
+            Ok(None) => Err(AppError::NotFound(format!("route {id}"))),
+            Err(e) => Err(map_write_error(e, "route", &id.to_hex())),
+        }
+    }
+
+    pub async fn set_route_active(&self, id: ObjectId, active: bool) -> Result<Route> {
+        let update = doc! { "$set": {
+            "active": active,
+            "updated_at": date(Utc::now()),
+        } };
+        self.update_route(id, update).await
+    }
+
+    pub async fn delete_route(&self, id: ObjectId) -> Result<()> {
+        let result = self.routes().delete_one(doc! { "_id": id }).await?;
+        if result.deleted_count == 0 {
+            return Err(AppError::NotFound(format!("route {id}")));
+        }
+        Ok(())
     }
 }
 

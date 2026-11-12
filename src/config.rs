@@ -43,6 +43,7 @@ pub struct ServerConfig {
     pub concurrency: usize,
     /// Deliver one message at a time, ignoring `concurrency`.
     pub sequential: bool,
+    /// Accounts to try per message. `0` tries every eligible account.
     pub max_attempts: usize,
     /// Disable an account after this many consecutive send failures
     /// (`0` disables the feature).
@@ -65,7 +66,7 @@ impl Default for ServerConfig {
             mode: SelectionMode::Priority,
             concurrency: 8,
             sequential: false,
-            max_attempts: 3,
+            max_attempts: 0,
             fail_threshold: 5,
             send_timeout_secs: 60,
             auth_required: false,
@@ -190,19 +191,9 @@ impl Config {
                 "server.concurrency must be at least 1".into(),
             ));
         }
-        if self.server.max_attempts == 0 {
-            return Err(AppError::Config(
-                "server.max_attempts must be at least 1".into(),
-            ));
-        }
         if self.server.max_message_size == 0 {
             return Err(AppError::Config(
                 "server.max_message_size must be positive".into(),
-            ));
-        }
-        if self.server.auth_required && self.server.users.is_empty() {
-            return Err(AppError::Config(
-                "server.auth_required is on but no users are configured".into(),
             ));
         }
         for user in &self.server.users {
@@ -341,14 +332,15 @@ mod tests {
     }
 
     #[test]
-    fn rejects_auth_without_users() {
+    fn auth_without_users_is_valid_at_config_layer() {
         let mut config = Config::default();
         config.server.auth_required = true;
-        assert!(config.validate().is_err());
+        // Routes stored in MongoDB may provide the credentials at runtime.
+        config.validate().unwrap();
         config.server.users.push(Credential {
             username: "u".into(),
-            password: "p".into(),
+            password: String::new(),
         });
-        config.validate().unwrap();
+        assert!(config.validate().is_err());
     }
 }
