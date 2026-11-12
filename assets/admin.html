@@ -55,6 +55,19 @@
   </section>
 
   <section>
+    <h2>MongoDB</h2>
+    <p class="muted" style="margin:0 0 10px">Current server database: <b id="current-db">—</b></p>
+    <div class="row" style="margin-bottom:10px">
+      <input id="new-db" type="text" placeholder="new database name" autocomplete="off">
+      <button id="create-db">Create / initialize</button>
+    </div>
+    <div class="scroll"><table>
+      <thead><tr><th>Database</th><th>Collections</th><th>Current</th></tr></thead>
+      <tbody id="databases"><tr><td colspan="3" class="muted">—</td></tr></tbody>
+    </table></div>
+  </section>
+
+  <section>
     <h2>Accounts</h2>
     <div class="scroll"><table>
       <thead><tr>
@@ -146,6 +159,20 @@ function renderAccounts(accounts) {
     </tr>`;
   }).join('');
 }
+function renderDatabases(data) {
+  document.getElementById('current-db').textContent = data.current || '—';
+  const databases = data.databases || [];
+  const body = document.getElementById('databases');
+  if (!databases.length) {
+    body.innerHTML = '<tr><td colspan="3" class="muted">no databases</td></tr>';
+    return;
+  }
+  body.innerHTML = databases.map((database) => `<tr>
+    <td>${escapeHtml(database.name)}</td>
+    <td class="num">${escapeHtml(database.collections)}</td>
+    <td>${database.current ? '<span class="pill ok">yes</span>' : ''}</td>
+  </tr>`).join('');
+}
 function renderRoutes(routes) {
   const body = document.getElementById('routes');
   if (!routes.length) { body.innerHTML = '<tr><td colspan="5" class="muted">no routes (legacy global pool)</td></tr>'; return; }
@@ -176,10 +203,12 @@ function renderLogs(logs) {
 async function refresh() {
   if (!token) return;
   try {
-    const [stats, accounts, routes, logs] = await Promise.all([
-      api('/api/stats'), api('/api/accounts'), api('/api/routes'), api('/api/send_log?limit=50'),
+    const [stats, databases, accounts, routes, logs] = await Promise.all([
+      api('/api/stats'), api('/api/databases'), api('/api/accounts'),
+      api('/api/routes'), api('/api/send_log?limit=50'),
     ]);
     renderStats(stats);
+    renderDatabases(databases);
     renderAccounts(accounts.accounts || []);
     renderRoutes(routes.routes || []);
     renderLogs(logs.logs || []);
@@ -210,6 +239,17 @@ document.addEventListener('click', (event) => {
     api(`/api/routes/${encodeURIComponent(button.dataset.route)}/${button.dataset.action}`, {method: 'POST'})
       .then(refresh).catch((error) => setStatus(error.message, true));
   }
+});
+document.getElementById('create-db').addEventListener('click', async () => {
+  const input = document.getElementById('new-db');
+  const name = input.value.trim();
+  if (!name) return;
+  try {
+    await api('/api/databases', {method: 'POST', body: JSON.stringify({name})});
+    input.value = '';
+    setStatus('database initialized: ' + name, false);
+    await refresh();
+  } catch (error) { setStatus(error.message, true); }
 });
 document.getElementById('connect').addEventListener('click', () => {
   token = tokenInput.value.trim();

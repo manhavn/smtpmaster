@@ -310,8 +310,11 @@ Mở `http://127.0.0.1:8787`, nhập token. Mọi request `/api/*` yêu cầu he
 `Authorization: Bearer <token>`; token tối thiểu 16 ký tự và chỉ hiển thị dạng
 mask. Mặc định chỉ bind loopback — đổi sang `0.0.0.0` sẽ in cảnh báo.
 
-Dashboard cho xem stats, danh sách account (bật/tắt/reset/sửa count max, total
-max, rate limit, priority), danh sách route (bật/tắt) và 50 lần gửi gần nhất.
+Dashboard liệt kê các MongoDB database, đánh dấu database đang dùng và tạo/khởi
+tạo schema smtpmaster cho database mới. Đồng thời xem stats, account
+(bật/tắt/reset/sửa count max, total max, rate limit, priority), route (bật/tắt)
+và 50 lần gửi gần nhất. Tiến trình đang chạy vẫn dùng database lúc khởi động;
+database mới tạo để dùng về sau bằng `--mongo-db`.
 Nếu mở dashboard ra ngoài loopback, hãy đặt sau reverse proxy TLS. Token được
 lưu trong MongoDB giống mật khẩu SMTP, nên hãy giới hạn quyền truy cập database.
 Trạng thái bật/tắt được lưu trong MongoDB; tiến trình `serve` đọc lại mỗi 2

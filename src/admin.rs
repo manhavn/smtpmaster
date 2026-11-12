@@ -128,6 +128,7 @@ pub fn router(store: Arc<Store>, token: String) -> Router {
         .route("/routes", get(list_routes))
         .route("/routes/{key}/enable", post(enable_route))
         .route("/routes/{key}/disable", post(disable_route))
+        .route("/databases", get(list_databases).post(create_database))
         .route("/send_log", get(send_log))
         .layer(middleware::from_fn_with_state(state.clone(), authorize))
         .with_state(state);
@@ -288,6 +289,31 @@ async fn reset_account(
     let account = state.store.find_account(&key).await?;
     let updated = state.store.reset_usage(&account, Utc::now()).await?;
     Ok(Json(json!({ "account": updated.redacted() })))
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateDatabase {
+    name: String,
+}
+
+async fn list_databases(State(state): State<AdminState>) -> ApiResult<Json<Value>> {
+    let databases = state.store.list_databases().await?;
+    Ok(Json(json!({
+        "current": state.store.database_name(),
+        "databases": databases,
+    })))
+}
+
+async fn create_database(
+    State(state): State<AdminState>,
+    Json(body): Json<CreateDatabase>,
+) -> ApiResult<Json<Value>> {
+    state.store.init_database(&body.name).await?;
+    Ok(Json(json!({
+        "initialized": body.name.trim(),
+        "current": state.store.database_name(),
+        "note": "the running server keeps using its configured database; use --mongo-db to switch",
+    })))
 }
 
 async fn list_routes(State(state): State<AdminState>) -> ApiResult<Json<Value>> {

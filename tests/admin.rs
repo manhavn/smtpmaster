@@ -300,3 +300,54 @@ async fn watch_toggles_dashboard_without_restarting() {
     watcher.abort();
     let _ = store.database().drop().await;
 }
+
+#[tokio::test]
+async fn dashboard_lists_and_creates_databases() {
+    let Some(store) = test_store("smtpmaster_admin_db").await else {
+        eprintln!("skipping: SMTPMASTER_TEST_MONGO_URI not set");
+        return;
+    };
+    let app = admin::router(Arc::clone(&store), TOKEN.to_string());
+
+    let (status, body) = call(&app, Method::GET, "/api/databases", Some(TOKEN), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["current"], store.database_name());
+    assert!(body["databases"].is_array());
+
+    let (status, body) = call(
+        &app,
+        Method::POST,
+        "/api/databases",
+        Some(TOKEN),
+        Some(json!({"name": "created_by_dashboard"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["initialized"], "created_by_dashboard");
+
+    let (_, body) = call(&app, Method::GET, "/api/databases", Some(TOKEN), None).await;
+    let databases = body["databases"].as_array().unwrap();
+    let created = databases
+        .iter()
+        .find(|database| database["name"] == "created_by_dashboard")
+        .expect("created database is listed");
+    assert!(created["collections"].as_u64().unwrap() >= 3);
+
+    let (status, _) = call(
+        &app,
+        Method::POST,
+        "/api/databases",
+        Some(TOKEN),
+        Some(json!({"name": "bad/name"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let _ = store
+        .database()
+        .client()
+        .database("created_by_dashboard")
+        .drop()
+        .await;
+    let _ = store.database().drop().await;
+}

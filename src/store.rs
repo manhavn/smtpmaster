@@ -39,6 +39,13 @@ pub struct MaintenanceReport {
     pub accounts_disabled: u64,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct DatabaseInfo {
+    pub name: String,
+    pub collections: u64,
+    pub current: bool,
+}
+
 #[derive(Debug, Default, Clone, Serialize)]
 pub struct Stats {
     pub total_accounts: u64,
@@ -98,89 +105,52 @@ impl Store {
     }
 
     pub async fn ensure_indexes(&self) -> Result<()> {
-        self.accounts()
-            .create_index(
-                mongodb::IndexModel::builder()
-                    .keys(doc! { "name": 1 })
-                    .options(
-                        IndexOptions::builder()
-                            .unique(true)
-                            .name("uniq_name".to_string())
-                            .build(),
-                    )
-                    .build(),
-            )
-            .await?;
-        self.accounts()
-            .create_index(
-                mongodb::IndexModel::builder()
-                    .keys(doc! { "active": 1, "priority": 1, "last_used_at": 1 })
-                    .options(IndexOptions::builder().name("routing".to_string()).build())
-                    .build(),
-            )
-            .await?;
-        self.accounts()
-            .create_index(
-                mongodb::IndexModel::builder()
-                    .keys(doc! { "expires_at": 1 })
-                    .options(IndexOptions::builder().name("expiry".to_string()).build())
-                    .build(),
-            )
-            .await?;
-        self.routes()
-            .create_index(
-                mongodb::IndexModel::builder()
-                    .keys(doc! { "name": 1 })
-                    .options(
-                        IndexOptions::builder()
-                            .unique(true)
-                            .name("uniq_route_name".to_string())
-                            .build(),
-                    )
-                    .build(),
-            )
-            .await?;
-        self.routes()
-            .create_index(
-                mongodb::IndexModel::builder()
-                    .keys(doc! { "username": 1 })
-                    .options(
-                        IndexOptions::builder()
-                            .unique(true)
-                            .name("uniq_route_username".to_string())
-                            .build(),
-                    )
-                    .build(),
-            )
-            .await?;
-        self.logs()
-            .create_index(
-                mongodb::IndexModel::builder()
-                    .keys(doc! { "ts": 1 })
-                    .options(
-                        IndexOptions::builder()
-                            .name("log_ttl".to_string())
-                            .expire_after(Some(Duration::from_secs(
-                                u64::from(self.retention_days.max(1)) * 86_400,
-                            )))
-                            .build(),
-                    )
-                    .build(),
-            )
-            .await?;
-        self.logs()
-            .create_index(
-                mongodb::IndexModel::builder()
-                    .keys(doc! { "account_id": 1, "ts": -1 })
-                    .options(
-                        IndexOptions::builder()
-                            .name("log_account".to_string())
-                            .build(),
-                    )
-                    .build(),
-            )
-            .await?;
-        Ok(())
+        ensure_indexes_in(&self.db, self.retention_days).await
+    }
+
+    pub fn database_name(&self) -> &str {
+        self.db.name()
+    }
+
+    /// Create the smtpmaster collections and indexes in `name` (idempotent).
+    pub async fn init_database(&self, name: &str) -> Result<()> {
+        let name = name.trim();
+        if name.is_empty()
+            || name
+                .chars()
+                .any(|c| matches!(c, '/' | '\\' | ' ' | '$' | '"'))
+        {
+            return Err(AppError::Invalid(format!(
+                "`{name}` is not a valid MongoDB database name"
+            )));
+        }
+        let database = self.db.client().database(name);
+        ensure_indexes_in(&database, self.retention_days).await
+    }
+
+    /// Databases on the server, with the one this process uses marked current.
+    pub async fn list_databases(&self) -> Result<Vec<DatabaseInfo>> {
+        let names = self.db.client().list_database_names().await?;
+        let mut out = Vec::new();
+        for name in names {
+            if matches!(name.as_str(), "admin" | "local" | "config") {
+                continue;
+            }
+            let database = self.db.client().database(&name);
+            let collections = database.list_collection_names().await?.len() as u64;
+            out.push(DatabaseInfo {
+                current: name == self.database_name(),
+                name,
+                collections,
+            });
+        }
+        out.sort_by(|left, right| {
+            right
+                .current
+                .cmp(&left.current)
+                .then_with(|| left.name.cmp(&right.name))
+        });
+        Ok(out)
     }
 
     pub async fn insert_account(&self, account: &Account) -> Result<()> {
@@ -680,6 +650,93 @@ impl Store {
         }
         Ok(())
     }
+}
+
+async fn ensure_indexes_in(db: &Database, retention_days: u32) -> Result<()> {
+    let accounts = db.collection::<Account>("accounts");
+    let routes = db.collection::<Route>("routes");
+    let logs = db.collection::<SendLog>("send_log");
+    accounts
+        .create_index(
+            mongodb::IndexModel::builder()
+                .keys(doc! { "name": 1 })
+                .options(
+                    IndexOptions::builder()
+                        .unique(true)
+                        .name("uniq_name".to_string())
+                        .build(),
+                )
+                .build(),
+        )
+        .await?;
+    accounts
+        .create_index(
+            mongodb::IndexModel::builder()
+                .keys(doc! { "active": 1, "priority": 1, "last_used_at": 1 })
+                .options(IndexOptions::builder().name("routing".to_string()).build())
+                .build(),
+        )
+        .await?;
+    accounts
+        .create_index(
+            mongodb::IndexModel::builder()
+                .keys(doc! { "expires_at": 1 })
+                .options(IndexOptions::builder().name("expiry".to_string()).build())
+                .build(),
+        )
+        .await?;
+    routes
+        .create_index(
+            mongodb::IndexModel::builder()
+                .keys(doc! { "name": 1 })
+                .options(
+                    IndexOptions::builder()
+                        .unique(true)
+                        .name("uniq_route_name".to_string())
+                        .build(),
+                )
+                .build(),
+        )
+        .await?;
+    routes
+        .create_index(
+            mongodb::IndexModel::builder()
+                .keys(doc! { "username": 1 })
+                .options(
+                    IndexOptions::builder()
+                        .unique(true)
+                        .name("uniq_route_username".to_string())
+                        .build(),
+                )
+                .build(),
+        )
+        .await?;
+    logs.create_index(
+        mongodb::IndexModel::builder()
+            .keys(doc! { "ts": 1 })
+            .options(
+                IndexOptions::builder()
+                    .name("log_ttl".to_string())
+                    .expire_after(Some(Duration::from_secs(
+                        u64::from(retention_days.max(1)) * 86_400,
+                    )))
+                    .build(),
+            )
+            .build(),
+    )
+    .await?;
+    logs.create_index(
+        mongodb::IndexModel::builder()
+            .keys(doc! { "account_id": 1, "ts": -1 })
+            .options(
+                IndexOptions::builder()
+                    .name("log_account".to_string())
+                    .build(),
+            )
+            .build(),
+    )
+    .await?;
+    Ok(())
 }
 
 fn date(value: DateTime<Utc>) -> Bson {
